@@ -1,0 +1,30 @@
+# VeriFin AI Agent - FREE Version Requirements (FIXED)
+
+# LangChain
+langchain==0.1.0
+langchain-community==0.0.13
+
+# OCR
+pytesseract==0.3.10
+opencv-python==4.8.1.78
+Pillow
+pdf2image==1.17.0
+
+# Machine Learning (FIXED)
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.12.0
+scikit-learn>=1.4.0
+
+# Database
+pymongo==4.6.1
+
+# API Server
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+
+# Utilities
+python-dotenv==1.0.0
+loguru==0.7.2
+requests==2.31.0
