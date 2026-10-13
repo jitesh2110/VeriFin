@@ -1,0 +1,29 @@
+{
+  "company_id": "comp_default",
+  "company_name": "Default Enterprise",
+  "buyer_gstins": [],
+  "ocr_settings": {
+    "confidence_threshold": 0.70,
+    "required_fields": [
+      "invoice_number",
+      "vendor_name",
+      "total_amount",
+      "invoice_date"
+    ],
+    "custom_extraction_rules": [
+      "Extract invoice number, invoice date, vendor name, vendor GSTIN, and line items.",
+      "Identify CGST, SGST, IGST tax breakdown.",
+      "Distinguish between seller/vendor information and buyer/recipient information."
+    ]
+  },
+  "chat_settings": {
+    "persona": "You are VeriFin, a friendly and accurate Financial Assistant. Answer questions about invoices in simple, clear language.",
+    "tone": "professional_conversational",
+    "strictness": "standard"
+  },
+  "compliance_thresholds": {
+    "unusual_amount_multiplier": 3.0,
+    "hsn_price_deviation_percent": 50.0,
+    "flag_missing_gst": true
+  }
+}

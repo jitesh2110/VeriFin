@@ -38,10 +38,29 @@ const InvoiceSchema = new mongoose.Schema({
     gstAmount: Number
   }],
   
-  // File Information
+  // Tenant and Project Scoping
+  companyId: {
+    type: String,
+    default: 'comp_default',
+    index: true
+  },
+  projectId: {
+    type: String,
+    default: 'proj_default',
+    index: true
+  },
+  isManualEntry: {
+    type: Boolean,
+    default: false
+  },
+  
+  // File & Storage Information (Optimized WebP)
   fileName: String,
   filePath: String,
   fileType: String,
+  imageUrl: String,
+  thumbnailUrl: String,
+  storageInfo: mongoose.Schema.Types.Mixed,
   
   // OCR and Processing
   ocrAccuracy: {
@@ -51,7 +70,7 @@ const InvoiceSchema = new mongoose.Schema({
   extractedText: String,
   processingStatus: {
     type: String,
-    enum: ['pending', 'processing', 'completed', 'failed'],
+    enum: ['pending', 'processing', 'completed', 'failed', 'needs_manual_review'],
     default: 'pending'
   },
   

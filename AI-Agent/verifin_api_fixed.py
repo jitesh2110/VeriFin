@@ -3,18 +3,20 @@ VeriFin - Fixed API Server
 Working version with all compliance features
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 import uvicorn
 import os
+import sys
 import shutil
 import json
 from pathlib import Path
 from datetime import datetime
 import google.generativeai as genai
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import pandas as pd
 import numpy as np
 import re
@@ -23,12 +25,24 @@ from PIL import Image
 import io
 from dotenv import load_dotenv
 
+# Ensure UTF-8 output encoding on Windows console
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 # Import our existing components
 from gemini_vision_ocr import gemini_vision_ocr  # Gemini Vision OCR
 from ml_trainer import VeriFinMLTrainer
 from database import VeriFinDatabase
 from gst_verifier import gst_verifier
 from hsn_sac_verifier import hsn_sac_verifier  # HSN/SAC Verification
+
+# Multi-Tenancy, Storage & Prompt Config components
+from auth_middleware import get_current_user, TenantUser
+from image_optimizer import image_optimizer
+from prompt_manager import prompt_manager
 
 # NEW: Import LangChain integration (optional)
 try:
@@ -43,8 +57,12 @@ except ImportError:
 app = FastAPI(
     title="VeriFin - Complete Compliance API", 
     version="2.0.0",
-    description="AI-powered invoice processing with full regulatory compliance"
+    description="AI-powered invoice processing with full regulatory compliance & multi-tenancy"
 )
+
+# Mount /uploads for static access to optimized receipt images and thumbnails
+os.makedirs("uploads", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # Add CORS middleware with more permissive settings
 app.add_middleware(
@@ -132,47 +150,103 @@ async def health_check():
     }
 
 @app.get("/api/invoices/history")
-async def get_invoice_history(limit: int = 50):
-    """Get invoice history from database"""
+async def get_invoice_history(
+    limit: int = 50,
+    project_id: Optional[str] = None,
+    current_user: TenantUser = Depends(get_current_user)
+):
+    """Get invoice history from tenant database"""
     try:
-        invoices = db.get_invoice_history(limit)
-        return {"success": True, "invoices": invoices, "count": len(invoices)}
+        active_project = project_id or current_user.active_project_id
+        invoices = db.get_invoice_history(
+            limit=limit,
+            company_id=current_user.company_id,
+            project_id=active_project
+        )
+        return {
+            "success": True,
+            "invoices": invoices,
+            "count": len(invoices),
+            "companyId": current_user.company_id,
+            "projectId": active_project
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 @app.get("/api/vendors")
-async def get_vendors():
-    """Get list of all vendors"""
+async def get_vendors(
+    current_user: TenantUser = Depends(get_current_user)
+):
+    """Get list of vendors for current tenant company"""
     try:
-        vendors = db.get_vendor_list()
-        return {"success": True, "vendors": vendors, "count": len(vendors)}
+        vendors = db.get_vendor_list(company_id=current_user.company_id)
+        return {
+            "success": True,
+            "vendors": vendors,
+            "count": len(vendors),
+            "companyId": current_user.company_id
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 @app.get("/api/anomalies")
-async def get_anomalies(severity: str = None, limit: int = 50):
-    """Get detected anomalies"""
+async def get_anomalies(
+    severity: Optional[str] = None,
+    limit: int = 50,
+    project_id: Optional[str] = None,
+    current_user: TenantUser = Depends(get_current_user)
+):
+    """Get detected anomalies from tenant database"""
     try:
-        anomalies = db.get_anomalies(severity, limit)
-        return {"success": True, "anomalies": anomalies, "count": len(anomalies)}
+        anomalies = db.get_anomalies(
+            severity=severity,
+            limit=limit,
+            company_id=current_user.company_id,
+            project_id=project_id or current_user.active_project_id
+        )
+        return {
+            "success": True,
+            "anomalies": anomalies,
+            "count": len(anomalies),
+            "companyId": current_user.company_id
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 @app.get("/api/dashboard/stats")
-async def get_dashboard_stats():
-    """Get dashboard statistics"""
+async def get_dashboard_stats(
+    project_id: Optional[str] = None,
+    current_user: TenantUser = Depends(get_current_user)
+):
+    """Get dashboard statistics for tenant company"""
     try:
-        stats = db.get_dashboard_stats()
-        return {"success": True, "stats": stats}
+        stats = db.get_dashboard_stats(
+            company_id=current_user.company_id,
+            project_id=project_id or current_user.active_project_id
+        )
+        return {
+            "success": True,
+            "stats": stats,
+            "companyId": current_user.company_id,
+            "companyName": current_user.company_name
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 @app.get("/api/dashboard/anomaly-trends")
-async def get_anomaly_trends(days: int = 30):
-    """Get anomaly trends for the last N days"""
+async def get_anomaly_trends(
+    days: int = 30,
+    project_id: Optional[str] = None,
+    current_user: TenantUser = Depends(get_current_user)
+):
+    """Get anomaly trends for tenant company"""
     try:
-        trends = db.get_anomaly_trends(days=days)
-        return {"success": True, "trends": trends}
+        trends = db.get_anomaly_trends(
+            days=days,
+            company_id=current_user.company_id,
+            project_id=project_id or current_user.active_project_id
+        )
+        return {"success": True, "trends": trends, "companyId": current_user.company_id}
     except Exception as e:
         return {"success": False, "error": str(e), "trends": []}
 
@@ -181,50 +255,35 @@ class ChatRequest(BaseModel):
     message: str
 
 @app.post("/api/chat")
-async def chat_with_gemini(request: ChatRequest):
-    """Chat with Gemini AI about invoices"""
+async def chat_with_gemini(
+    request: ChatRequest,
+    current_user: TenantUser = Depends(get_current_user)
+):
+    """Chat with Gemini AI with company-tailored persona and data context"""
     try:
-        # Get context from database
-        stats = db.get_dashboard_stats()
-        vendors = db.get_vendor_list()
-        anomalies = db.get_anomalies(limit=10)
-        invoices = db.get_invoice_history(limit=10)
+        # Get context from tenant database
+        stats = db.get_dashboard_stats(company_id=current_user.company_id)
+        vendors = db.get_vendor_list(company_id=current_user.company_id)
+        anomalies = db.get_anomalies(limit=10, company_id=current_user.company_id)
+        invoices = db.get_invoice_history(limit=10, company_id=current_user.company_id)
         
-        # Build context for Gemini
-        context = f"""You are VeriFin, a friendly Financial Assistant. Answer questions about invoices in simple, clear language.
-
-IMPORTANT RULES:
-1. DO NOT use markdown formatting (no **, *, #, etc.)
-2. Use simple, conversational language
-3. Keep responses short and to the point (2-3 sentences max)
-4. Use plain text only, no special formatting
-5. Speak like you're talking to a business person, not a technical expert
-
-Current Data:
-- Total Invoices: {stats.get('totalInvoices', 0)}
-- Total Vendors: {stats.get('totalVendors', 0)}
-- Total Anomalies: {stats.get('totalAnomalies', 0)}
-- Total Amount Processed: ₹{stats.get('totalAmountProcessed', 0):,.2f}
-
-Recent Invoices:
-{json.dumps(invoices[:3], indent=2, default=str)}
-
-Vendors:
-{json.dumps(vendors[:3], indent=2, default=str)}
-
-Anomalies:
-{json.dumps(anomalies[:3], indent=2, default=str)}
-
-User Question: {request.message}
-
-Answer in simple, plain English without any markdown or technical jargon. Be brief and friendly."""
+        # Build prompt using company-specific configuration
+        context = prompt_manager.build_chat_system_prompt(
+            company_id=current_user.company_id,
+            stats=stats,
+            invoices=invoices,
+            vendors=vendors,
+            anomalies=anomalies,
+            user_message=request.message
+        )
 
         # Get response from Gemini
         response = gemini_model.generate_content(context)
         
         return {
             "success": True,
-            "response": response.text
+            "response": response.text,
+            "companyId": current_user.company_id
         }
     except Exception as e:
         print(f"Chat error: {str(e)}")
@@ -234,160 +293,358 @@ Answer in simple, plain English without any markdown or technical jargon. Be bri
             "response": "Sorry, I'm having trouble processing your request. Please try again."
         }
 
+# Company Configuration Management Endpoints
+@app.get("/api/config/tenant")
+async def get_tenant_config(
+    current_user: TenantUser = Depends(get_current_user)
+):
+    """Get configuration and prompt rules for current company"""
+    config = prompt_manager.get_tenant_config(current_user.company_id)
+    return {"success": True, "config": config, "companyId": current_user.company_id}
+
+@app.post("/api/config/tenant")
+async def save_tenant_config(
+    config: Dict[str, Any] = Body(...),
+    current_user: TenantUser = Depends(get_current_user)
+):
+    """Save or update company configuration and custom prompt rules"""
+    saved = prompt_manager.save_tenant_config(current_user.company_id, config)
+    return {"success": saved, "message": "Company configuration updated"}
+
+# Pydantic models for Manual Invoices & Line Items
+class LineItemModel(BaseModel):
+    description: str = "Item"
+    hsn_code: Optional[str] = ""
+    quantity: float = 1.0
+    rate: float = 0.0
+    amount: float = 0.0
+    gst_rate: Optional[str] = None
+    gst_amount: Optional[float] = None
+
+class ManualInvoiceRequest(BaseModel):
+    invoiceNumber: str
+    vendorName: str
+    invoiceDate: str
+    invoiceAmount: float
+    gstNumbers: List[str] = []
+    gstRate: Optional[str] = "18%"
+    cgstRate: Optional[str] = "9%"
+    sgstRate: Optional[str] = "9%"
+    igstRate: Optional[str] = "0%"
+    hsnNumber: Optional[str] = ""
+    hsnSacCodes: List[str] = []
+    lineItems: List[LineItemModel] = []
+    vendorAddress: Optional[str] = ""
+    imageUrl: Optional[str] = None
+    thumbnailUrl: Optional[str] = None
+    rawText: Optional[str] = ""
+
+def process_and_save_invoice_internal(
+    invoice_data: Dict[str, Any],
+    line_items: List[Dict[str, Any]],
+    enhanced_data: Dict[str, Any],
+    company_id: str,
+    project_id: str,
+    image_url: Optional[str] = None,
+    thumbnail_url: Optional[str] = None,
+    storage_info: Optional[Dict[str, Any]] = None,
+    is_manual: bool = False,
+    existing_invoice_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Internal helper to run full compliance and save invoice to tenant database"""
+    # 1. GST Verification with RapidAPI
+    gst_verification_results = []
+    gst_missing = False
+    
+    if invoice_data.get('gst_numbers') and len(invoice_data['gst_numbers']) > 0:
+        print(f"🔍 Verifying GST numbers: {invoice_data['gst_numbers']}")
+        for gst_num in invoice_data['gst_numbers']:
+            verification = gst_verifier.verify_gst(gst_num)
+            gst_verification_results.append(verification)
+            
+            if verification.get('success'):
+                name_match = gst_verifier.check_vendor_name_match(
+                    verification, 
+                    invoice_data.get('vendor_name', '')
+                )
+                verification['vendor_name_match'] = name_match
+    else:
+        gst_missing = True
+        gst_verification_results.append({
+            "success": False,
+            "error": "GST number not found in invoice",
+            "is_valid": False,
+            "gst_missing": True
+        })
+    
+    invoice_data['gst_verification'] = gst_verification_results
+    invoice_data['gst_missing'] = gst_missing
+    
+    # 2. HSN/SAC Code Verification
+    hsn_sac_verification_results = []
+    line_items_verification = None
+    hsn_codes = enhanced_data.get('hsn_sac_codes', [])
+    
+    if line_items and len(line_items) > 0:
+        line_items_verification = hsn_sac_verifier.verify_with_line_items(line_items)
+        hsn_sac_verification_results = line_items_verification['verifications']
+    elif hsn_codes and len(hsn_codes) > 0:
+        for code in hsn_codes:
+            if code and code != 'Unknown':
+                verification = hsn_sac_verifier.verify_code(code)
+                hsn_sac_verification_results.append(verification)
+    
+    invoice_data['hsn_sac_verification'] = hsn_sac_verification_results
+    invoice_data['hsn_sac_line_items_verification'] = line_items_verification
+    
+    # 3. ML Anomaly Detection
+    ml_features = extract_ml_features(invoice_data)
+    ml_result = None
+    if ml_features:
+        ml_result = ml_trainer.predict_anomaly(ml_features)
+    
+    # 4. Complete Compliance Scoring
+    compliance_results = process_complete_compliance(invoice_data, enhanced_data, ml_result)
+    
+    # 5. Store/Update invoice in MongoDB
+    invoice_storage_data = {
+        **invoice_data,
+        'companyId': company_id,
+        'projectId': project_id,
+        'image_url': image_url,
+        'thumbnail_url': thumbnail_url,
+        'storage_info': storage_info or {},
+        'is_manual_entry': is_manual,
+        'processing_status': 'completed',
+        'compliance_results': compliance_results,
+        'ml_prediction': ml_result,
+        'gst_verification': gst_verification_results,
+        'gst_missing': gst_missing,
+        'hsn_sac_verification': hsn_sac_verification_results,
+        'hsn_sac_line_items_verification': line_items_verification,
+        'line_items': line_items
+    }
+
+    if existing_invoice_id:
+        from bson import ObjectId
+        tenant_db = db.get_tenant_db(company_id)
+        try:
+            obj_id = ObjectId(existing_invoice_id)
+        except Exception:
+            obj_id = existing_invoice_id
+        tenant_db['invoices'].update_one({'_id': obj_id}, {'$set': invoice_storage_data})
+        invoice_id = str(existing_invoice_id)
+    else:
+        invoice_id = db.store_invoice(invoice_storage_data, company_id=company_id, project_id=project_id)
+    
+    # 6. Detect anomalies by comparing with historical data
+    db_anomalies = db.detect_anomalies(invoice_storage_data, invoice_id, company_id=company_id, project_id=project_id)
+    
+    # 7. AI Analysis (optional)
+    ai_analysis_result = None
+    if LANGCHAIN_AVAILABLE:
+        try:
+            ai_analysis_result = analyze_invoice_hybrid(
+                invoice_data={
+                    "invoice_number": invoice_data.get('invoice_number'),
+                    "vendor_name": invoice_data.get('vendor_name'),
+                    "invoice_date": invoice_data.get('invoice_date'),
+                    "total_amount": invoice_data.get('total_amount', 0),
+                    "gst_numbers": invoice_data.get('gst_numbers', []),
+                    "gst_verification": gst_verification_results,
+                    "hsn_verification": hsn_sac_verification_results,
+                    "ml_analysis": ml_result,
+                    "database_anomalies": db_anomalies,
+                    "compliance_results": compliance_results,
+                    "line_items": line_items
+                },
+                invoice_id=invoice_id,
+                use_ai=True
+            )
+            if ai_analysis_result and ai_analysis_result.get("ai_used"):
+                ai_data = {
+                    "ai_analysis": ai_analysis_result.get("ai_analysis"),
+                    "ai_used": ai_analysis_result.get("ai_used", False),
+                    "ai_confidence": ai_analysis_result.get("ai_confidence"),
+                    "ai_analysis_timestamp": datetime.now()
+                }
+                tenant_db = db.get_tenant_db(company_id)
+                from bson import ObjectId
+                try:
+                    obj_id = ObjectId(invoice_id)
+                except Exception:
+                    obj_id = invoice_id
+                tenant_db['invoices'].update_one({"_id": obj_id}, {"$set": ai_data})
+        except Exception as e:
+            print(f"⚠️ AI Analysis failed: {e}")
+            ai_analysis_result = {"ai_used": False, "error": str(e)}
+
+    # Format response
+    return {
+        "success": True,
+        "message": "Invoice processed with complete compliance checking",
+        "filename": invoice_data.get('filename', 'invoice'),
+        "processing_timestamp": datetime.now().isoformat(),
+        "companyId": company_id,
+        "projectId": project_id,
+        "imageUrl": image_url,
+        "thumbnailUrl": thumbnail_url,
+        "storageInfo": storage_info,
+        "isManualEntry": is_manual,
+        "data": {
+            "invoiceNumber": safe_convert(invoice_data.get('invoice_number', 'Unknown')),
+            "vendorName": safe_convert(invoice_data.get('vendor_name', 'Unknown')),
+            "invoiceAmount": safe_convert(invoice_data.get('total_amount', 0)),
+            "invoiceDate": safe_convert(invoice_data.get('invoice_date', 'Unknown')),
+            "gstNumbers": invoice_data.get('gst_numbers', []),
+            "gstRate": invoice_data.get('gst_rate', 'Unknown'),
+            "hsnNumber": invoice_data.get('hsn_number', 'Unknown'),
+            "ocrConfidence": float(invoice_data.get('ocr_confidence', 100.0 if is_manual else 0.0)),
+            "imageUrl": image_url,
+            "thumbnailUrl": thumbnail_url,
+            "hsnSacCodes": enhanced_data.get('hsn_sac_codes', []),
+            "itemDescriptions": enhanced_data.get('item_descriptions', []),
+            "quantities": enhanced_data.get('quantities', []),
+            "mlPrediction": convert_numpy_types(ml_result) if ml_result else {"is_anomaly": False, "confidence": 0},
+            "complianceScore": compliance_results['compliance_score'],
+            "complianceStatus": compliance_results['compliance_status'],
+            "checksPassedCount": compliance_results['checks_passed'],
+            "totalChecksCount": 12,
+            "riskScore": compliance_results['risk_score'],
+            "riskLevel": compliance_results['risk_level'],
+            "gstVerification": gst_verification_results,
+            "gstMissing": gst_missing,
+            "hsnSacVerification": hsn_sac_verification_results,
+            "hsnSacCodesFound": len(hsn_codes),
+            "hsnSacValid": sum(1 for v in hsn_sac_verification_results if v.get('is_valid')),
+            "hsnSacInvalid": sum(1 for v in hsn_sac_verification_results if not v.get('is_valid')),
+            "hsnSacLineItemsVerification": line_items_verification,
+            "hsnSacRateMismatches": line_items_verification['rate_mismatches'] if line_items_verification else [],
+            "hsnSacRateMismatchCount": line_items_verification['rate_mismatch_count'] if line_items_verification else 0,
+            "gstValidations": compliance_results['gst_validations'],
+            "hsnValidations": compliance_results['hsn_validations'],
+            "duplicateCheck": compliance_results['duplicate_check'],
+            "arithmeticCheck": compliance_results['arithmetic_check'],
+            "priceAnalysis": compliance_results['price_analysis'],
+            "anomaliesDetected": compliance_results['anomalies_detected'],
+            "databaseAnomalies": db_anomalies,
+            "invoiceId": invoice_id,
+            "aiAnalysis": {
+                "enabled": LANGCHAIN_AVAILABLE,
+                "used": ai_analysis_result.get("ai_used") if ai_analysis_result else False,
+                "analysis": ai_analysis_result.get("ai_analysis") if ai_analysis_result else None,
+                "confidence": ai_analysis_result.get("ai_confidence") if ai_analysis_result else None
+            }
+        }
+    }
+
 @app.post("/api/invoices/upload")
-async def upload_invoice_complete(file: UploadFile = File(...)):
-    """Complete invoice processing with all 12 compliance features"""
+async def upload_invoice_complete(
+    file: UploadFile = File(...),
+    current_user: TenantUser = Depends(get_current_user)
+):
+    """Complete invoice processing with image optimization, tenant prompt, and mid-layer fallback"""
     try:
         # Save uploaded file
         file_path = UPLOAD_DIR / file.filename
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        print(f"📄 Processing: {file.filename}")
+        print(f"📄 Processing: {file.filename} for company [{current_user.company_id}]")
         
-        # Convert PDF to image if needed
-        if file.filename.lower().endswith('.pdf'):
-            image_path = convert_pdf_to_image(file_path)
-        else:
-            image_path = file_path
-        
-        # OCR Processing with Gemini Vision (AI-powered, 95%+ accuracy)
-        ocr_result = gemini_vision_ocr.process_invoice(str(file_path))
-        
-        print("\n===== GEMINI DEBUG START =====")
-
-        print("OCR RESULT TYPE:", type(ocr_result))
-        print("OCR RESULT:", ocr_result)
-
-        # If it's an object (Gemini response)
+        # Optimize image to WebP and generate thumbnail (Item 2: storage optimization)
         try:
-            print("TEXT OUTPUT:", ocr_result.text)
-        except:
-            print("No .text field in ocr_result")
+            storage_result = image_optimizer.optimize_and_store(
+                file_path=file_path,
+                company_id=current_user.company_id
+            )
+            print(f"📦 Stored WebP image ({storage_result['savings_percent']}% savings): {storage_result['image_url']}")
+        except Exception as e:
+            print(f"⚠️ Image optimizer warning: {e}")
+            storage_result = {
+                "image_url": f"/uploads/{file.filename}",
+                "thumbnail_url": f"/uploads/{file.filename}",
+                "savings_percent": 0.0
+            }
 
-        print("===== GEMINI DEBUG END =====\n")
+        # OCR Processing with Gemini Vision using company-specific prompt
+        ocr_result = None
+        try:
+            ocr_result = gemini_vision_ocr.process_invoice(str(file_path), company_id=current_user.company_id)
+        except Exception as ocr_err:
+            print(f"⚠️ Gemini OCR error: {ocr_err}")
+            ocr_result = {"success": False, "error": str(ocr_err)}
 
-        if not ocr_result:
-            error_msg = ocr_result.get('error', 'OCR processing failed') if ocr_result else 'Unknown OCR error'
-            return {"success": False, "error": error_msg}
+        # Check for OCR breakdown / low confidence (Item 1: Mid-layer manual fallback)
+        ocr_failed = (
+            not ocr_result 
+            or not ocr_result.get('success') 
+            or float(ocr_result.get('confidence', 0)) < 65.0
+        )
+
+        if ocr_failed:
+            print("🚨 AI OCR broke down or has low confidence! Offering mid-layer manual entry fallback.")
+            partial_structured = ocr_result.get('structured_data', {}) if ocr_result else {}
+            
+            # Create a draft invoice in tenant database
+            draft_storage_data = {
+                'filename': file.filename,
+                'invoice_number': partial_structured.get('invoice_number', 'Unknown'),
+                'vendor_name': partial_structured.get('vendor_name', 'Unknown'),
+                'total_amount': float(partial_structured.get('total_amount', 0)),
+                'invoice_date': partial_structured.get('invoice_date', 'Unknown'),
+                'gst_numbers': partial_structured.get('gst_numbers', []),
+                'ocr_confidence': float(ocr_result.get('confidence', 0)) if ocr_result else 0.0,
+                'raw_text': ocr_result.get('raw_text', '') if ocr_result else '',
+                'image_url': storage_result.get('image_url'),
+                'thumbnail_url': storage_result.get('thumbnail_url'),
+                'storage_info': storage_result,
+                'is_manual_entry': False,
+                'processing_status': 'needs_manual_review'
+            }
+            draft_id = db.store_invoice(
+                draft_storage_data,
+                company_id=current_user.company_id,
+                project_id=current_user.active_project_id
+            )
+
+            return {
+                "success": False,
+                "needs_manual_review": True,
+                "draftId": draft_id,
+                "message": "AI OCR extraction encountered an error or low confidence. You can review and enter invoice details manually.",
+                "filename": file.filename,
+                "imageUrl": storage_result.get('image_url'),
+                "thumbnailUrl": storage_result.get('thumbnail_url'),
+                "storageInfo": storage_result,
+                "partialData": {
+                    "invoiceNumber": partial_structured.get('invoice_number', ''),
+                    "vendorName": partial_structured.get('vendor_name', ''),
+                    "invoiceDate": partial_structured.get('invoice_date', ''),
+                    "invoiceAmount": float(partial_structured.get('total_amount', 0)),
+                    "gstNumbers": partial_structured.get('gst_numbers', []),
+                    "ocrConfidence": float(ocr_result.get('confidence', 0)) if ocr_result else 0.0
+                }
+            }
         
         # Enhanced data extraction
-        
-        raw_text = ocr_result.get('raw_text') or ocr_result.get('text') or ocr_result.get('content') or ""
-
+        raw_text = ocr_result.get('raw_text') or ocr_result.get('text') or ""
         enhanced_data = extract_enhanced_invoice_data(raw_text)
         
-        # Prepare invoice data
-        # Convert total_amount to float
+        # Total amount conversion
         total_amount_raw = ocr_result['structured_data'].get('total_amount', 0)
         try:
             total_amount = float(str(total_amount_raw).replace(',', '')) if total_amount_raw else 0
-        except:
+        except Exception:
             total_amount = 0
         
         invoice_data = {
             'filename': file.filename,
             'invoice_number': ocr_result['structured_data'].get('invoice_number', 'Unknown'),
-            'total_amount': total_amount,  # Now a float!
+            'total_amount': total_amount,
             'invoice_date': ocr_result['structured_data'].get('invoice_date', 'Unknown'),
             'vendor_name': ocr_result['structured_data'].get('vendor_name', 'Unknown'),
             'gst_numbers': ocr_result['structured_data'].get('gst_numbers', []),
-            'ocr_confidence': ocr_result['confidence'],
-            'raw_text': ocr_result['raw_text']
-        }
-        
-        # GST Verification with RapidAPI (Real Government Data)
-        gst_verification_results = []
-        gst_missing = False
-        
-        if invoice_data.get('gst_numbers') and len(invoice_data['gst_numbers']) > 0:
-            print(f"🔍 Verifying GST numbers: {invoice_data['gst_numbers']}")
-            for gst_num in invoice_data['gst_numbers']:
-                verification = gst_verifier.verify_gst(gst_num)
-                gst_verification_results.append(verification)
-                
-                # Check vendor name match
-                if verification.get('success'):
-                    name_match = gst_verifier.check_vendor_name_match(
-                        verification, 
-                        invoice_data.get('vendor_name', '')
-                    )
-                    verification['vendor_name_match'] = name_match
-                    
-                    if verification.get('is_active'):
-                        print(f"✅ GST {gst_num}: Active - {verification.get('legal_name')}")
-                    else:
-                        print(f"⚠️ GST {gst_num}: {verification.get('status')}")
-        else:
-            gst_missing = True
-            print("⚠️ No GST number found in invoice!")
-            gst_verification_results.append({
-                "success": False,
-                "error": "GST number not found in invoice",
-                "is_valid": False,
-                "gst_missing": True
-            })
-        
-        # Add GST verification to invoice data
-        invoice_data['gst_verification'] = gst_verification_results
-        invoice_data['gst_missing'] = gst_missing
-        
-        # HSN/SAC Code Verification (Real Government Data)
-        hsn_sac_verification_results = []
-        line_items_verification = None
-        hsn_codes = enhanced_data.get('hsn_sac_codes', [])
-        line_items = ocr_result['structured_data'].get('line_items', [])
-        
-        # Method 1: Verify with line items (includes GST rate matching)
-        if line_items and len(line_items) > 0:
-            print(f"🔍 Verifying {len(line_items)} line items with HSN/SAC codes and GST rates...")
-            line_items_verification = hsn_sac_verifier.verify_with_line_items(line_items)
-            hsn_sac_verification_results = line_items_verification['verifications']
-            
-            print(f"   ✅ Valid codes: {line_items_verification['valid_codes']}")
-            print(f"   ❌ Invalid codes: {line_items_verification['invalid_codes']}")
-            print(f"   ⚠️  Rate mismatches: {line_items_verification['rate_mismatch_count']}")
-            
-            if line_items_verification['rate_mismatches']:
-                for mismatch in line_items_verification['rate_mismatches']:
-                    print(f"      ⚠️  {mismatch['item']}: HSN {mismatch['hsn_code']} - Expected {mismatch['actual_rate']}%, Got {mismatch['extracted_rate']}%")
-        
-        # Method 2: Verify all HSN codes (fallback if no line items)
-        elif hsn_codes and len(hsn_codes) > 0:
-            print(f"🔍 Verifying HSN/SAC codes: {hsn_codes}")
-            for code in hsn_codes:
-                if code and code != 'Unknown':
-                    verification = hsn_sac_verifier.verify_code(code)
-                    hsn_sac_verification_results.append(verification)
-                    print(f"   {'✅' if verification.get('is_valid') else '❌'} {code}: {verification.get('description', 'N/A')}")
-        else:
-            print("⚠️ No HSN/SAC codes found in invoice!")
-        
-        # Add HSN/SAC verification to invoice data
-        invoice_data['hsn_sac_verification'] = hsn_sac_verification_results
-        invoice_data['hsn_sac_line_items_verification'] = line_items_verification
-        
-        # ML Anomaly Detection      
-        ml_features = extract_ml_features(invoice_data)
-
-        print("🧠 ML FEATURES:", ml_features)
-        print("🧠 ML FEATURE COUNT:", len(ml_features) if ml_features else 0)
-        print("🧠 ML MODEL TRAINED:", ml_trainer.is_trained)
-
-        ml_result = None
-
-        if ml_features:
-            ml_result = ml_trainer.predict_anomaly(ml_features)
-            print("🧠 ML RESULT:", ml_result)
-        else:
-            print("❌ ML FEATURES ARE EMPTY - PREDICTION SKIPPED")
-        
-        # Complete Compliance Processing
-        compliance_results = process_complete_compliance(invoice_data, enhanced_data, ml_result)
-        
-        # Store invoice in MongoDB
-        invoice_storage_data = {
-            **invoice_data,
             'gst_rate': ocr_result['structured_data'].get('gst_rate', 'Unknown'),
             'cgst_rate': ocr_result['structured_data'].get('cgst_rate', 'Unknown'),
             'sgst_rate': ocr_result['structured_data'].get('sgst_rate', 'Unknown'),
@@ -396,154 +653,138 @@ async def upload_invoice_complete(file: UploadFile = File(...)):
             'hsn_sac_codes': enhanced_data.get('hsn_sac_codes', []),
             'item_descriptions': enhanced_data.get('item_descriptions', []),
             'quantities': enhanced_data.get('quantities', []),
-            'compliance_results': compliance_results,
-            'ml_prediction': ml_result,
-            'gst_verification': gst_verification_results,
-            'gst_missing': gst_missing,
-            'hsn_sac_verification': hsn_sac_verification_results,
-            'hsn_sac_line_items_verification': line_items_verification,
-            'line_items': line_items
+            'ocr_confidence': ocr_result.get('confidence', 95.0),
+            'raw_text': ocr_result.get('raw_text', '')
         }
-        invoice_id = db.store_invoice(invoice_storage_data)
-        
-        # Detect anomalies by comparing with historical data
-        db_anomalies = db.detect_anomalies(invoice_storage_data, invoice_id)
-        
-        # NEW: AI-Powered Analysis with LangChain
-        ai_analysis_result = None
-        if LANGCHAIN_AVAILABLE:
-            try:
-                print("🤖 Running AI Agent Analysis...")
-                ai_analysis_result = analyze_invoice_hybrid(
-                    invoice_data={
-                        "invoice_number": invoice_data.get('invoice_number'),
-                        "vendor_name": invoice_data.get('vendor_name'),
-                        "invoice_date": invoice_data.get('invoice_date'),
-                        "total_amount": invoice_data.get('total_amount', 0),
-                        "gst_numbers": invoice_data.get('gst_numbers', []),
+        line_items = ocr_result['structured_data'].get('line_items', [])
 
-                        "gst_verification": gst_verification_results,
+        return process_and_save_invoice_internal(
+            invoice_data=invoice_data,
+            line_items=line_items,
+            enhanced_data=enhanced_data,
+            company_id=current_user.company_id,
+            project_id=current_user.active_project_id,
+            image_url=storage_result.get('image_url'),
+            thumbnail_url=storage_result.get('thumbnail_url'),
+            storage_info=storage_result,
+            is_manual=False
+        )
 
-                        "hsn_verification": hsn_sac_verification_results,
-
-                        "ml_analysis": ml_result,
-
-                        "database_anomalies": db_anomalies,
-
-                        "compliance_results": compliance_results,
-
-                        "line_items": line_items
-                    },
-                    invoice_id=invoice_id,
-                    use_ai=True
-                )
-                print(f"✅ AI Analysis Complete: {ai_analysis_result.get('ai_used')}")
-                print("\n========== ACTUAL AI ANALYSIS ==========")
-                print(ai_analysis_result.get("ai_analysis"))
-                print("=========================================\n")
-
-                # ============================================================
-                # STORE AI ANALYSIS RESULT IN MONGODB
-                # ============================================================
-                if ai_analysis_result and ai_analysis_result.get("ai_used"):
-
-                    ai_data = {
-                        "ai_analysis": ai_analysis_result.get("ai_analysis"),
-                        "ai_used": ai_analysis_result.get("ai_used", False),
-                        "ai_confidence": ai_analysis_result.get("ai_confidence"),
-                        "ai_analysis_timestamp": datetime.now()
-                    }
-
-                    db.invoices.update_one(
-                        {"_id": invoice_id},
-                        {"$set": ai_data}
-                    )
-
-                    print("💾 AI Analysis stored in MongoDB")
-                    print("🤖 AI RESULT:")
-                    print(ai_analysis_result.get("ai_analysis"))
-            except Exception as e:
-                print(f"⚠️  AI Analysis failed: {e}")
-                ai_analysis_result = {"ai_used": False, "error": str(e)}
-        
-        # Format response
-        response = {
-            "success": True,
-            "message": "Invoice processed with complete compliance checking",
-            "filename": file.filename,
-            "processing_timestamp": datetime.now().isoformat(),
-            "data": {
-                # Basic extraction
-                "invoiceNumber": safe_convert(invoice_data.get('invoice_number', 'Unknown')),
-                "vendorName": safe_convert(invoice_data.get('vendor_name', 'Unknown')),
-                "invoiceAmount": safe_convert(invoice_data.get('total_amount', 0)),
-                "invoiceDate": safe_convert(invoice_data.get('invoice_date', 'Unknown')),
-                "gstNumbers": invoice_data.get('gst_numbers', []),
-                "gstRate": ocr_result['structured_data'].get('gst_rate', 'Unknown'),
-                "hsnNumber": ocr_result['structured_data'].get('hsn_number', 'Unknown'),
-                "ocrConfidence": float(ocr_result['confidence']),
-                
-                # Enhanced extraction
-                "hsnSacCodes": enhanced_data.get('hsn_sac_codes', []),
-                "itemDescriptions": enhanced_data.get('item_descriptions', []),
-                "quantities": enhanced_data.get('quantities', []),
-                
-                # ML Analysis
-                "mlPrediction": convert_numpy_types(ml_result) if ml_result else {"is_anomaly": False, "confidence": 0},
-                
-                # Compliance Results
-                "complianceScore": compliance_results['compliance_score'],
-                "complianceStatus": compliance_results['compliance_status'],
-                "checksPassedCount": compliance_results['checks_passed'],
-                "totalChecksCount": 12,
-                "riskScore": compliance_results['risk_score'],
-                "riskLevel": compliance_results['risk_level'],
-                
-                # GST Verification (Real Government Data)
-                "gstVerification": gst_verification_results,
-                "gstMissing": gst_missing,
-                
-                # HSN/SAC Verification (Real Government Data)
-                "hsnSacVerification": hsn_sac_verification_results,
-                "hsnSacCodesFound": len(hsn_codes),
-                "hsnSacValid": sum(1 for v in hsn_sac_verification_results if v.get('is_valid')),
-                "hsnSacInvalid": sum(1 for v in hsn_sac_verification_results if not v.get('is_valid')),
-                "hsnSacLineItemsVerification": line_items_verification,
-                "hsnSacRateMismatches": line_items_verification['rate_mismatches'] if line_items_verification else [],
-                "hsnSacRateMismatchCount": line_items_verification['rate_mismatch_count'] if line_items_verification else 0,
-                
-                # Detailed results
-                "gstValidations": compliance_results['gst_validations'],
-                "hsnValidations": compliance_results['hsn_validations'],
-                "duplicateCheck": compliance_results['duplicate_check'],
-                "arithmeticCheck": compliance_results['arithmetic_check'],
-                "priceAnalysis": compliance_results['price_analysis'],
-                "anomaliesDetected": compliance_results['anomalies_detected'],
-                
-                # Database anomalies (historical comparison)
-                "databaseAnomalies": db_anomalies,
-                "invoiceId": invoice_id,
-                
-                # NEW: AI Analysis Results
-                "aiAnalysis": {
-                    "enabled": LANGCHAIN_AVAILABLE,
-                    "used": ai_analysis_result.get("ai_used") if ai_analysis_result else False,
-                    "analysis": ai_analysis_result.get("ai_analysis") if ai_analysis_result else None,
-                    "confidence": ai_analysis_result.get("ai_confidence") if ai_analysis_result else None,
-                    "ruleBasedAnomalies": ai_analysis_result.get("rule_based_anomalies") if ai_analysis_result else None
-                },
-                
-                "processingMethod": "verifin_complete_v2_with_langchain"
-            }
-        }
-        
-        return response
-        
     except Exception as e:
         print(f"❌ Upload processing failed: {e}")
         import traceback
         traceback.print_exc()
         return {"success": False, "error": f"Processing failed: {str(e)}"}
+
+# Mid-Layer Manual Entry & Review Endpoints (Item 1)
+@app.post("/api/invoices/manual")
+async def create_manual_invoice(
+    request: ManualInvoiceRequest,
+    current_user: TenantUser = Depends(get_current_user)
+):
+    """
+    Manually create and validate an invoice when AI OCR breaks down
+    or for manual business entry with complete compliance checking
+    """
+    try:
+        print(f"📝 Processing manual invoice entry for company [{current_user.company_id}]...")
+        
+        line_items_dict = [item.dict() for item in request.lineItems]
+        hsn_codes = request.hsnSacCodes or [item.hsn_code for item in request.lineItems if item.hsn_code]
+        
+        invoice_data = {
+            'filename': f"manual_{request.invoiceNumber}.pdf",
+            'invoice_number': request.invoiceNumber,
+            'vendor_name': request.vendorName,
+            'total_amount': float(request.invoiceAmount),
+            'invoice_date': request.invoiceDate,
+            'gst_numbers': request.gstNumbers,
+            'gst_rate': request.gstRate or "18%",
+            'cgst_rate': request.cgstRate or "9%",
+            'sgst_rate': request.sgstRate or "9%",
+            'igst_rate': request.igstRate or "0%",
+            'hsn_number': request.hsnNumber or (hsn_codes[0] if hsn_codes else "Unknown"),
+            'hsn_sac_codes': hsn_codes,
+            'item_descriptions': [item.description for item in request.lineItems],
+            'quantities': [item.quantity for item in request.lineItems],
+            'ocr_confidence': 100.0,
+            'raw_text': request.rawText or f"Manual Entry: {request.invoiceNumber} from {request.vendorName}"
+        }
+
+        enhanced_data = {
+            'hsn_sac_codes': hsn_codes,
+            'item_descriptions': invoice_data['item_descriptions'],
+            'quantities': invoice_data['quantities']
+        }
+
+        return process_and_save_invoice_internal(
+            invoice_data=invoice_data,
+            line_items=line_items_dict,
+            enhanced_data=enhanced_data,
+            company_id=current_user.company_id,
+            project_id=current_user.active_project_id,
+            image_url=request.imageUrl,
+            thumbnail_url=request.thumbnailUrl,
+            is_manual=True
+        )
+    except Exception as e:
+        print(f"❌ Manual invoice creation failed: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.put("/api/invoices/{invoice_id}/review")
+async def review_and_update_invoice(
+    invoice_id: str,
+    request: ManualInvoiceRequest,
+    current_user: TenantUser = Depends(get_current_user)
+):
+    """
+    Update and re-validate an existing invoice after manual review
+    """
+    try:
+        print(f"🔄 Updating reviewed invoice [{invoice_id}] for company [{current_user.company_id}]...")
+        
+        line_items_dict = [item.dict() for item in request.lineItems]
+        hsn_codes = request.hsnSacCodes or [item.hsn_code for item in request.lineItems if item.hsn_code]
+        
+        invoice_data = {
+            'filename': f"reviewed_{request.invoiceNumber}.pdf",
+            'invoice_number': request.invoiceNumber,
+            'vendor_name': request.vendorName,
+            'total_amount': float(request.invoiceAmount),
+            'invoice_date': request.invoiceDate,
+            'gst_numbers': request.gstNumbers,
+            'gst_rate': request.gstRate or "18%",
+            'cgst_rate': request.cgstRate or "9%",
+            'sgst_rate': request.sgstRate or "9%",
+            'igst_rate': request.igstRate or "0%",
+            'hsn_number': request.hsnNumber or (hsn_codes[0] if hsn_codes else "Unknown"),
+            'hsn_sac_codes': hsn_codes,
+            'item_descriptions': [item.description for item in request.lineItems],
+            'quantities': [item.quantity for item in request.lineItems],
+            'ocr_confidence': 100.0,
+            'raw_text': request.rawText or f"Reviewed Entry: {request.invoiceNumber}"
+        }
+
+        enhanced_data = {
+            'hsn_sac_codes': hsn_codes,
+            'item_descriptions': invoice_data['item_descriptions'],
+            'quantities': invoice_data['quantities']
+        }
+
+        return process_and_save_invoice_internal(
+            invoice_data=invoice_data,
+            line_items=line_items_dict,
+            enhanced_data=enhanced_data,
+            company_id=current_user.company_id,
+            project_id=current_user.active_project_id,
+            image_url=request.imageUrl,
+            thumbnail_url=request.thumbnailUrl,
+            is_manual=True,
+            existing_invoice_id=invoice_id
+        )
+    except Exception as e:
+        print(f"❌ Review update failed: {e}")
+        return {"success": False, "error": str(e)}
 
 def convert_pdf_to_image(pdf_path):
     """Convert PDF to image"""

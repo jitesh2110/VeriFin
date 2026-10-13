@@ -6,6 +6,25 @@ const User = require('./models/User');
 // JWT Secret (in production, use environment variable)
 const JWT_SECRET = process.env.JWT_SECRET || 'verifin-secret-key-2025';
 
+// Helper to create token with multi-tenant claims
+const createTenantToken = (user) => {
+  return jwt.sign(
+    {
+      id: user._id,
+      userId: user._id,
+      username: user.username,
+      email: user.email,
+      role: user.role,
+      companyId: user.companyId || 'comp_default',
+      companyName: user.companyName || 'Default Enterprise',
+      assignedProjects: user.assignedProjects || [],
+      activeProjectId: user.activeProjectId || 'proj_default'
+    },
+    JWT_SECRET,
+    { expiresIn: '7d' }
+  );
+};
+
 // Middleware to verify JWT token
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
@@ -15,11 +34,13 @@ const authenticateToken = (req, res, next) => {
     return res.status(401).json({ success: false, message: 'Access token required' });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
     if (err) {
       return res.status(403).json({ success: false, message: 'Invalid or expired token' });
     }
-    req.user = user;
+    req.user = decoded;
+    req.companyId = decoded.companyId || 'comp_default';
+    req.projectId = decoded.activeProjectId || 'proj_default';
     next();
   });
 };
@@ -27,7 +48,7 @@ const authenticateToken = (req, res, next) => {
 // POST /api/auth/signup - Register new user
 router.post('/signup', async (req, res) => {
   try {
-    const { username, email, password, role } = req.body;
+    const { username, email, password, role, companyId, companyName, assignedProjects, activeProjectId } = req.body;
 
     // Validation
     if (!username || !email || !password) {
@@ -46,22 +67,22 @@ router.post('/signup', async (req, res) => {
       });
     }
 
-    // Create new user
+    // Create new user with tenant details
     const user = new User({
       username,
       email,
       password,
-      role: role || 'user' // Default to 'user' if not specified
+      role: role || 'user',
+      companyId: companyId || 'comp_default',
+      companyName: companyName || 'Default Enterprise',
+      assignedProjects: assignedProjects || [{ projectId: 'proj_default', projectName: 'Default Project', role: 'member' }],
+      activeProjectId: activeProjectId || 'proj_default'
     });
 
     await user.save();
 
-    // Generate JWT token
-    const token = jwt.sign(
-      { id: user._id, username: user.username, email: user.email, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
+    // Generate JWT token with tenant claims
+    const token = createTenantToken(user);
 
     res.status(201).json({
       success: true,
@@ -71,7 +92,11 @@ router.post('/signup', async (req, res) => {
         id: user._id,
         username: user.username,
         email: user.email,
-        role: user.role
+        role: user.role,
+        companyId: user.companyId,
+        companyName: user.companyName,
+        assignedProjects: user.assignedProjects,
+        activeProjectId: user.activeProjectId
       }
     });
   } catch (error) {
@@ -119,12 +144,8 @@ router.post('/login', async (req, res) => {
     user.lastLogin = new Date();
     await user.save();
 
-    // Generate JWT token
-    const token = jwt.sign(
-      { id: user._id, username: user.username, email: user.email, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
+    // Generate JWT token with tenant claims
+    const token = createTenantToken(user);
 
     res.json({
       success: true,
@@ -135,6 +156,10 @@ router.post('/login', async (req, res) => {
         username: user.username,
         email: user.email,
         role: user.role,
+        companyId: user.companyId || 'comp_default',
+        companyName: user.companyName || 'Default Enterprise',
+        assignedProjects: user.assignedProjects || [],
+        activeProjectId: user.activeProjectId || 'proj_default',
         lastLogin: user.lastLogin
       }
     });
@@ -151,7 +176,7 @@ router.post('/login', async (req, res) => {
 // GET /api/auth/verify - Verify JWT token
 router.get('/verify', authenticateToken, async (req, res) => {
   try {
-    const user = await User.findById(req.user.id).select('-password');
+    const user = await User.findById(req.user.id || req.user.userId).select('-password');
     if (!user) {
       return res.status(404).json({
         success: false,
@@ -166,6 +191,10 @@ router.get('/verify', authenticateToken, async (req, res) => {
         username: user.username,
         email: user.email,
         role: user.role,
+        companyId: user.companyId || 'comp_default',
+        companyName: user.companyName || 'Default Enterprise',
+        assignedProjects: user.assignedProjects || [],
+        activeProjectId: user.activeProjectId || 'proj_default',
         lastLogin: user.lastLogin
       }
     });

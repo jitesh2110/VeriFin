@@ -1,0 +1,33 @@
+{
+  "company_id": "comp_techcorp",
+  "company_name": "TechCorp Logistics",
+  "buyer_gstins": [
+    "27AAACT1234F1Z5"
+  ],
+  "ocr_settings": {
+    "confidence_threshold": 0.75,
+    "required_fields": [
+      "invoice_number",
+      "vendor_name",
+      "total_amount",
+      "invoice_date",
+      "gst_numbers"
+    ],
+    "custom_extraction_rules": [
+      "CRITICAL: The buyer GST is 27AAACT1234F1Z5. NEVER extract this as vendor GST.",
+      "Extract Purchase Order (PO) number or Work Order reference if present in invoice header.",
+      "Extract Vehicle/Truck Registration number or E-Way Bill number if present in dispatch details.",
+      "Extract freight, fuel surcharge, and detention charges if broken down in line items."
+    ]
+  },
+  "chat_settings": {
+    "persona": "You are VeriFin Logistics Auditor, specializing in supply chain logistics, freight expenses, and strict GST compliance for TechCorp Logistics.",
+    "tone": "auditor_concise",
+    "strictness": "high"
+  },
+  "compliance_thresholds": {
+    "unusual_amount_multiplier": 2.5,
+    "hsn_price_deviation_percent": 40.0,
+    "flag_missing_gst": true
+  }
+}

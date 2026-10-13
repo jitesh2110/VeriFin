@@ -21,8 +21,26 @@ const userSchema = new mongoose.Schema({
   },
   role: {
     type: String,
-    enum: ['user', 'admin'],
+    enum: ['user', 'admin', 'manager', 'auditor'],
     default: 'user'
+  },
+  companyId: {
+    type: String,
+    default: 'comp_default',
+    index: true
+  },
+  companyName: {
+    type: String,
+    default: 'Default Enterprise'
+  },
+  assignedProjects: [{
+    projectId: String,
+    projectName: String,
+    role: String
+  }],
+  activeProjectId: {
+    type: String,
+    default: 'proj_default'
   },
   createdAt: {
     type: Date,

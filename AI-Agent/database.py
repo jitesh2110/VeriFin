@@ -4,52 +4,89 @@ Handles invoice storage, vendor tracking, and anomaly detection
 """
 
 import os
+import sys
+import re
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 import json
 
+# Ensure UTF-8 output on Windows terminal
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 class VeriFinDatabase:
     def __init__(self, connection_string="mongodb://localhost:27017/"):
-        """Initialize MongoDB connection"""
+        """Initialize MongoDB connection with multi-tenant support"""
         self.client = MongoClient(connection_string)
-        db_name = os.getenv('MONGODB_DATABASE', 'verifin')
-        self.db = self.client[db_name]
+        self.default_db_name = os.getenv('MONGODB_DATABASE', 'verifin')
+        self.db = self.client[self.default_db_name]
         
-        # Collections
+        # Default collections for backwards compatibility
         self.invoices = self.db['invoices']
         self.vendors = self.db['vendors']
         self.anomalies = self.db['anomalies']
         
-        # Create indexes for faster queries
-        self._create_indexes()
+        self._initialized_tenants = set()
+        self._create_indexes_for_db(self.db)
+        self._initialized_tenants.add(self.default_db_name)
         
         print("✅ MongoDB connected successfully!")
-        print(f"   Database: {db_name}")
-        print(f"   Collections: invoices, vendors, anomalies")
+        print(f"   Default Database: {self.default_db_name}")
+        print(f"   Multi-Tenant Abstraction: Active (Dynamic Database-Per-Tenant)")
+
+    def get_tenant_db_name(self, company_id: Optional[str] = None) -> str:
+        """Returns the isolated database name for a given tenant company"""
+        if not company_id or company_id in ["default", "comp_default", "None"]:
+            return self.default_db_name
+        clean_id = re.sub(r'[^a-zA-Z0-9_-]', '_', str(company_id))
+        return f"verifin_tenant_{clean_id}"
+
+    def get_tenant_db(self, company_id: Optional[str] = None):
+        """Get or initialize isolated database for tenant company"""
+        db_name = self.get_tenant_db_name(company_id)
+        tenant_db = self.client[db_name]
+        if db_name not in self._initialized_tenants:
+            self._create_indexes_for_db(tenant_db)
+            self._initialized_tenants.add(db_name)
+        return tenant_db
+
+    def _create_indexes_for_db(self, target_db):
+        """Create indexes for optimized queries on target database"""
+        try:
+            target_db['invoices'].create_index([("invoiceNumber", ASCENDING)], unique=False)
+            target_db['invoices'].create_index([("gstNumber", ASCENDING)])
+            target_db['invoices'].create_index([("vendorName", ASCENDING)])
+            target_db['invoices'].create_index([("uploadDate", DESCENDING)])
+            target_db['invoices'].create_index([("projectId", ASCENDING)])
+            
+            target_db['vendors'].create_index([("gstNumber", ASCENDING)], unique=True)
+            target_db['vendors'].create_index([("vendorName", ASCENDING)])
+            
+            target_db['anomalies'].create_index([("invoiceId", ASCENDING)])
+            target_db['anomalies'].create_index([("anomalyType", ASCENDING)])
+            target_db['anomalies'].create_index([("severity", ASCENDING)])
+            target_db['anomalies'].create_index([("projectId", ASCENDING)])
+        except Exception as e:
+            print(f"⚠️ Index creation warning on {target_db.name}: {e}")
+
     def _create_indexes(self):
-        """Create indexes for optimized queries"""
-        # Invoice indexes
-        self.invoices.create_index([("invoiceNumber", ASCENDING)], unique=False)
-        self.invoices.create_index([("gstNumber", ASCENDING)])
-        self.invoices.create_index([("vendorName", ASCENDING)])
-        self.invoices.create_index([("uploadDate", DESCENDING)])
-        
-        # Vendor indexes
-        self.vendors.create_index([("gstNumber", ASCENDING)], unique=True)
-        self.vendors.create_index([("vendorName", ASCENDING)])
-        
-        # Anomaly indexes
-        self.anomalies.create_index([("invoiceId", ASCENDING)])
-        self.anomalies.create_index([("anomalyType", ASCENDING)])
-        self.anomalies.create_index([("severity", ASCENDING)])
+        """Create indexes on default database"""
+        self._create_indexes_for_db(self.db)
     
-    def store_invoice(self, invoice_data: Dict[str, Any]) -> str:
+    def store_invoice(self, invoice_data: Dict[str, Any], company_id: str = "comp_default", project_id: str = "proj_default") -> str:
         """
-        Store invoice in database
+        Store invoice in tenant database
         Returns: invoice_id
         """
+        tenant_db = self.get_tenant_db(company_id)
+        
         invoice_doc = {
+            'companyId': company_id,
+            'projectId': project_id,
             'filename': invoice_data.get('filename'),
             'uploadDate': datetime.now(),
             'invoiceNumber': invoice_data.get('invoice_number'),
@@ -63,34 +100,43 @@ class VeriFinDatabase:
             'hsnCodes': invoice_data.get('hsn_sac_codes', []),
             'itemDescriptions': invoice_data.get('item_descriptions', []),
             'quantities': invoice_data.get('quantities', []),
+            'lineItems': invoice_data.get('line_items', []),
             'ocrConfidence': float(invoice_data.get('ocr_confidence', 0)),
             'complianceResults': invoice_data.get('compliance_results', {}),
             'mlPrediction': invoice_data.get('ml_prediction', {}),
+            'imageUrl': invoice_data.get('image_url'),
+            'thumbnailUrl': invoice_data.get('thumbnail_url'),
+            'storageInfo': invoice_data.get('storage_info', {}),
+            'isManualEntry': invoice_data.get('is_manual_entry', False),
+            'processingStatus': invoice_data.get('processing_status', 'completed'),
             'rawText': invoice_data.get('raw_text', '')[:1000]  # Store first 1000 chars
         }
         
-        result = self.invoices.insert_one(invoice_doc)
+        result = tenant_db['invoices'].insert_one(invoice_doc)
         invoice_id = str(result.inserted_id)
         
-        # Update vendor statistics
-        self._update_vendor_stats(invoice_doc)
+        # Update vendor statistics in tenant database
+        self._update_vendor_stats(invoice_doc, tenant_db=tenant_db)
         
-        print(f"✅ Invoice stored: {invoice_doc['invoiceNumber']} (ID: {invoice_id})")
+        print(f"✅ Invoice stored in [{tenant_db.name}]: {invoice_doc['invoiceNumber']} (ID: {invoice_id})")
         return invoice_id
     
-    def _update_vendor_stats(self, invoice_doc: Dict):
-        """Update or create vendor statistics"""
+    def _update_vendor_stats(self, invoice_doc: Dict, tenant_db=None):
+        """Update or create vendor statistics in tenant database"""
+        if tenant_db is None:
+            tenant_db = self.db
+            
         gst_number = invoice_doc.get('gstNumber')
         vendor_name = invoice_doc.get('vendorName')
         
         if not gst_number or gst_number == 'Unknown':
             return
         
-        vendor = self.vendors.find_one({'gstNumber': gst_number})
+        vendor = tenant_db['vendors'].find_one({'gstNumber': gst_number})
         
         if vendor:
             # Update existing vendor
-            self.vendors.update_one(
+            tenant_db['vendors'].update_one(
                 {'gstNumber': gst_number},
                 {
                     '$inc': {
@@ -105,7 +151,7 @@ class VeriFinDatabase:
             )
         else:
             # Create new vendor
-            self.vendors.insert_one({
+            tenant_db['vendors'].insert_one({
                 'gstNumber': gst_number,
                 'vendorName': vendor_name,
                 'totalInvoices': 1,
@@ -114,12 +160,13 @@ class VeriFinDatabase:
                 'lastInvoiceDate': datetime.now()
             })
     
-    def detect_anomalies(self, invoice_data: Dict[str, Any], invoice_id: str) -> List[Dict]:
+    def detect_anomalies(self, invoice_data: Dict[str, Any], invoice_id: str, company_id: str = "comp_default", project_id: Optional[str] = None) -> List[Dict]:
         """
-        Detect anomalies by comparing with historical data
+        Detect anomalies by comparing with historical data within tenant database
         Returns: List of detected anomalies
         """
         from bson import ObjectId
+        tenant_db = self.get_tenant_db(company_id)
         anomalies = []
         
         # Convert invoice_id to ObjectId for comparison
@@ -128,8 +175,8 @@ class VeriFinDatabase:
         except:
             obj_id = invoice_id
         
-        # 1. Check for duplicate invoice number
-        duplicate = self.invoices.find_one({
+        # 1. Check for duplicate invoice number in tenant db
+        duplicate = tenant_db['invoices'].find_one({
             'invoiceNumber': invoice_data.get('invoice_number'),
             '_id': {'$ne': obj_id}
         })
@@ -141,7 +188,7 @@ class VeriFinDatabase:
                 'relatedInvoiceId': str(duplicate['_id'])
             })
         
-        # 2. Check for missing GST number (No GST found in invoice)
+        # 2. Check for missing GST number
         gst_numbers = invoice_data.get('gst_numbers', [])
         gst_missing = invoice_data.get('gst_missing', False)
         
@@ -152,10 +199,9 @@ class VeriFinDatabase:
                 'description': f"No GST number found in invoice - Vendor: {invoice_data.get('vendor_name', 'Unknown')}",
             })
         
-        # 3. Check for invalid GST number (GST found but invalid format/verification failed)
+        # 3. Check for invalid GST number
         gst_number = gst_numbers[0] if gst_numbers else None
         if gst_number:
-            # Check if GST verification failed
             gst_verification = invoice_data.get('gst_verification', [])
             if gst_verification and len(gst_verification) > 0:
                 verification_result = gst_verification[0]
@@ -166,9 +212,9 @@ class VeriFinDatabase:
                         'description': f"Invalid GST number: {gst_number} - Verification failed",
                     })
         
-        # 4. Check for GST number with different vendor name
+        # 4. Check for GST number with different vendor name in tenant db
         if gst_number:
-            different_vendor = self.invoices.find_one({
+            different_vendor = tenant_db['invoices'].find_one({
                 'gstNumber': gst_number,
                 'vendorName': {'$ne': invoice_data.get('vendor_name')},
                 '_id': {'$ne': obj_id}
@@ -177,35 +223,25 @@ class VeriFinDatabase:
                 anomalies.append({
                     'type': 'GST_VENDOR_MISMATCH',
                     'severity': 'HIGH',
-                    'description': f"GST {gst_number} used by different vendor: {different_vendor['vendorName']} vs {invoice_data.get('vendor_name')}",
+                    'description': f"GST {gst_number} used by different vendor: {different_vendor.get('vendorName')} vs {invoice_data.get('vendor_name')}",
                     'relatedInvoiceId': str(different_vendor['_id'])
                 })
         
-        # 4. Check for unusual amount from same vendor
+        # 5. Check for unusual amount from same vendor
         vendor_name = invoice_data.get('vendor_name')
         if vendor_name and vendor_name != 'Unknown':
-            # Get average amount for this vendor
-            pipeline = [
-                {'$match': {'vendorName': vendor_name}},
-                {'$group': {
-                    '_id': None,
-                    'avgAmount': {'$avg': '$totalAmount'},
-                    'maxAmount': {'$max': '$totalAmount'},
-                    'minAmount': {'$min': '$totalAmount'}
-                }}
-            ]
-            stats = list(self.vendors_stats(vendor_name))
+            stats = list(self.vendors_stats(vendor_name, tenant_db=tenant_db))
             if stats:
                 avg_amount = stats[0].get('avgAmount', 0)
                 current_amount = float(invoice_data.get('total_amount', 0))
                 
-                # If amount is 3x more than average
                 if avg_amount > 0 and current_amount > (avg_amount * 3):
                     anomalies.append({
                         'type': 'UNUSUAL_AMOUNT',
                         'severity': 'MEDIUM',
                         'description': f"Amount ₹{current_amount} is 3x higher than vendor average ₹{avg_amount:.2f}"
                     })
+
         # Check for missing HSN / SAC codes
         hsn_codes = invoice_data.get('hsn_sac_codes', [])
         line_items = invoice_data.get('line_items', [])
@@ -215,18 +251,10 @@ class VeriFinDatabase:
             anomalies.append({
                 'type': 'MISSING_HSN_SAC',
                 'severity': 'MEDIUM',
-                'description': f"Missing HSN/SAC code for items in invoice: {invoice_data.get('invoice_number')}"
-            })
-        # Check for missing HSN / SAC codes
-        hsn_codes = invoice_data.get('hsn_sac_codes', [])
-        if not hsn_codes:
-            anomalies.append({
-                'type': 'MISSING_HSN_SAC',
-                'severity': 'MEDIUM',
                 'description': f"Missing HSN/SAC code in invoice: {invoice_data.get('invoice_number')}"
             })
         
-        # 5. Check for invalid HSN/SAC codes
+        # Check for invalid HSN/SAC codes
         hsn_sac_verification = invoice_data.get('hsn_sac_verification', [])
         if hsn_sac_verification:
             invalid_codes = [v for v in hsn_sac_verification if not v.get('is_valid')]
@@ -238,7 +266,7 @@ class VeriFinDatabase:
                         'description': f"Invalid HSN/SAC code: {invalid.get('code')} - {invalid.get('error', 'Not found in GST database')}"
                     })
         
-        # 5b. Check for GST rate mismatches in line items
+        # Check for GST rate mismatches in line items
         line_items_verification = invoice_data.get('hsn_sac_line_items_verification')
         if line_items_verification and line_items_verification.get('rate_mismatches'):
             for mismatch in line_items_verification['rate_mismatches']:
@@ -248,13 +276,12 @@ class VeriFinDatabase:
                     'description': f"GST rate mismatch for {mismatch['item']}: HSN {mismatch['hsn_code']} should have {mismatch['actual_rate']}% but invoice shows {mismatch['extracted_rate']}%"
                 })
         
-        # 6. Check for same HSN code with very different price
-        hsn_codes = invoice_data.get('hsn_sac_codes', [])
+        # Check for same HSN code with very different price
         if hsn_codes:
-            for hsn in hsn_codes[:3]:  # Check first 3 HSN codes
-                similar_invoices = list(self.invoices.find({
+            for hsn in hsn_codes[:3]:
+                similar_invoices = list(tenant_db['invoices'].find({
                     'hsnCodes': hsn,
-                    '_id': {'$ne': invoice_id}
+                    '_id': {'$ne': obj_id}
                 }).limit(10))
                 
                 if len(similar_invoices) >= 3:
@@ -263,18 +290,19 @@ class VeriFinDatabase:
                         avg_hsn_amount = sum(amounts) / len(amounts)
                         current_amount = float(invoice_data.get('total_amount', 0))
                         
-                        # If amount differs by more than 50%
                         if avg_hsn_amount > 0 and abs(current_amount - avg_hsn_amount) > (avg_hsn_amount * 0.5):
                             anomalies.append({
                                 'type': 'HSN_PRICE_DEVIATION',
                                 'severity': 'MEDIUM',
                                 'description': f"HSN {hsn}: Amount ₹{current_amount} deviates significantly from historical average ₹{avg_hsn_amount:.2f}"
                             })
-                            break  # Only report once
+                            break
         
-        # Store anomalies in database
+        # Store anomalies in tenant database
         for anomaly in anomalies:
-            self.anomalies.insert_one({
+            tenant_db['anomalies'].insert_one({
+                'companyId': company_id,
+                'projectId': project_id or 'proj_default',
                 'invoiceId': invoice_id,
                 'invoiceNumber': invoice_data.get('invoice_number'),
                 'anomalyType': anomaly['type'],
@@ -286,8 +314,10 @@ class VeriFinDatabase:
         
         return anomalies
     
-    def vendors_stats(self, vendor_name: str) -> List[Dict]:
-        """Get statistics for a vendor"""
+    def vendors_stats(self, vendor_name: str, tenant_db=None) -> List[Dict]:
+        """Get statistics for a vendor in tenant database"""
+        if tenant_db is None:
+            tenant_db = self.db
         pipeline = [
             {'$match': {'vendorName': vendor_name}},
             {'$group': {
@@ -298,11 +328,16 @@ class VeriFinDatabase:
                 'totalInvoices': {'$sum': 1}
             }}
         ]
-        return list(self.invoices.aggregate(pipeline))
+        return list(tenant_db['invoices'].aggregate(pipeline))
     
-    def get_invoice_history(self, limit: int = 50) -> List[Dict]:
-        """Get recent invoice history with anomalies"""
-        invoices = list(self.invoices.find().sort('uploadDate', DESCENDING).limit(limit))
+    def get_invoice_history(self, limit: int = 50, company_id: str = "comp_default", project_id: Optional[str] = None) -> List[Dict]:
+        """Get recent invoice history with anomalies from tenant database"""
+        tenant_db = self.get_tenant_db(company_id)
+        query = {}
+        if project_id and project_id not in ["all", "None", ""]:
+            query['projectId'] = project_id
+
+        invoices = list(tenant_db['invoices'].find(query).sort('uploadDate', DESCENDING).limit(limit))
         
         # Convert ObjectId to string and attach anomalies
         for inv in invoices:
@@ -310,8 +345,8 @@ class VeriFinDatabase:
             inv['_id'] = str(inv['_id'])
             inv['uploadDate'] = inv['uploadDate'].isoformat() if inv.get('uploadDate') else None
             
-            # Fetch anomalies for this invoice
-            anomalies = list(self.anomalies.find({'invoiceId': invoice_id}))
+            # Fetch anomalies for this invoice from tenant db
+            anomalies = list(tenant_db['anomalies'].find({'invoiceId': invoice_id}))
             for anomaly in anomalies:
                 anomaly['_id'] = str(anomaly['_id'])
                 if anomaly.get('detectedDate'):
@@ -320,9 +355,10 @@ class VeriFinDatabase:
         
         return invoices
     
-    def get_vendor_list(self) -> List[Dict]:
-        """Get list of all vendors"""
-        vendors = list(self.vendors.find().sort('totalAmount', DESCENDING))
+    def get_vendor_list(self, company_id: str = "comp_default") -> List[Dict]:
+        """Get list of all vendors in tenant database"""
+        tenant_db = self.get_tenant_db(company_id)
+        vendors = list(tenant_db['vendors'].find().sort('totalAmount', DESCENDING))
         
         for vendor in vendors:
             vendor['_id'] = str(vendor['_id'])
@@ -331,21 +367,24 @@ class VeriFinDatabase:
         
         return vendors
     
-    def get_anomalies(self, severity: Optional[str] = None, limit: int = 50) -> List[Dict]:
-        """Get detected anomalies with vendor information"""
+    def get_anomalies(self, severity: Optional[str] = None, limit: int = 50, company_id: str = "comp_default", project_id: Optional[str] = None) -> List[Dict]:
+        """Get detected anomalies from tenant database with vendor information"""
+        tenant_db = self.get_tenant_db(company_id)
         query = {}
         if severity:
             query['severity'] = severity
+        if project_id and project_id not in ["all", "None", ""]:
+            query['projectId'] = project_id
         
-        anomalies = list(self.anomalies.find(query).sort('detectedDate', DESCENDING).limit(limit))
+        anomalies = list(tenant_db['anomalies'].find(query).sort('detectedDate', DESCENDING).limit(limit))
         
         for anomaly in anomalies:
             anomaly['_id'] = str(anomaly['_id'])
             anomaly['detectedDate'] = anomaly['detectedDate'].isoformat() if anomaly.get('detectedDate') else None
             
-            # Fetch vendor name from invoice
+            # Fetch vendor name from tenant invoices
             if anomaly.get('invoiceId'):
-                invoice = self.invoices.find_one({'_id': anomaly['invoiceId']})
+                invoice = tenant_db['invoices'].find_one({'_id': anomaly['invoiceId']})
                 if invoice:
                     anomaly['vendor_name'] = invoice.get('vendorName', 'Unknown')
                     anomaly['invoice_number'] = invoice.get('invoiceNumber', anomaly.get('invoiceNumber', 'N/A'))
@@ -356,21 +395,29 @@ class VeriFinDatabase:
         
         return anomalies
     
-    def get_dashboard_stats(self) -> Dict:
-        """Get statistics for dashboard"""
-        total_invoices = self.invoices.count_documents({})
-        total_vendors = self.vendors.count_documents({})
-        total_anomalies = self.anomalies.count_documents({})
-        high_severity_anomalies = self.anomalies.count_documents({'severity': 'HIGH'})
+    def get_dashboard_stats(self, company_id: str = "comp_default", project_id: Optional[str] = None) -> Dict:
+        """Get statistics for dashboard from tenant database"""
+        tenant_db = self.get_tenant_db(company_id)
+        query = {}
+        if project_id and project_id not in ["all", "None", ""]:
+            query['projectId'] = project_id
+
+        total_invoices = tenant_db['invoices'].count_documents(query)
+        total_vendors = tenant_db['vendors'].count_documents({})
+        total_anomalies = tenant_db['anomalies'].count_documents(query)
+        high_severity_anomalies = tenant_db['anomalies'].count_documents({**query, 'severity': 'HIGH'})
         
         # Total amount processed
-        pipeline = [
-            {'$group': {
+        pipeline = []
+        if query:
+            pipeline.append({'$match': query})
+        pipeline.append({
+            '$group': {
                 '_id': None,
                 'totalAmount': {'$sum': '$totalAmount'}
-            }}
-        ]
-        amount_result = list(self.invoices.aggregate(pipeline))
+            }
+        })
+        amount_result = list(tenant_db['invoices'].aggregate(pipeline))
         total_amount = amount_result[0]['totalAmount'] if amount_result else 0
         
         return {
@@ -378,27 +425,31 @@ class VeriFinDatabase:
             'totalVendors': total_vendors,
             'totalAnomalies': total_anomalies,
             'highSeverityAnomalies': high_severity_anomalies,
-            'totalAmountProcessed': total_amount
+            'totalAmountProcessed': total_amount,
+            'companyId': company_id,
+            'database': tenant_db.name
         }
     
-    def get_anomaly_trends(self, days: int = 30) -> List[Dict[str, Any]]:
+    def get_anomaly_trends(self, days: int = 30, company_id: str = "comp_default", project_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        Get anomaly trends for the last N days
+        Get anomaly trends for the last N days from tenant database
         Returns daily counts of each anomaly type
         """
         from datetime import timedelta
+        tenant_db = self.get_tenant_db(company_id)
         
         # Calculate date range
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
         
-        # Aggregate anomalies by date and type
+        match_query = {
+            'detectedDate': {'$gte': start_date, '$lte': end_date}
+        }
+        if project_id and project_id not in ["all", "None", ""]:
+            match_query['projectId'] = project_id
+
         pipeline = [
-            {
-                '$match': {
-                    'detectedDate': {'$gte': start_date, '$lte': end_date}
-                }
-            },
+            {'$match': match_query},
             {
                 '$group': {
                     '_id': {
@@ -408,12 +459,10 @@ class VeriFinDatabase:
                     'count': {'$sum': 1}
                 }
             },
-            {
-                '$sort': {'_id.date': 1}
-            }
+            {'$sort': {'_id.date': 1}}
         ]
         
-        results = list(self.anomalies.aggregate(pipeline))
+        results = list(tenant_db['anomalies'].aggregate(pipeline))
         
         # Organize data by date
         trends_by_date = {}

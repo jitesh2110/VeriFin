@@ -1,0 +1,31 @@
+{
+  "company_id": "comp_globalretail",
+  "company_name": "Global Retail Corp",
+  "buyer_gstins": [
+    "24AABCG5678D1Z9"
+  ],
+  "ocr_settings": {
+    "confidence_threshold": 0.70,
+    "required_fields": [
+      "invoice_number",
+      "vendor_name",
+      "total_amount",
+      "invoice_date"
+    ],
+    "custom_extraction_rules": [
+      "CRITICAL: The buyer GST is 24AABCG5678D1Z9. NEVER extract this as vendor GST.",
+      "Check for trade discounts, retail SKUs, and product barcodes in line items.",
+      "Ensure line items capture SKU quantity and individual unit rates."
+    ]
+  },
+  "chat_settings": {
+    "persona": "You are VeriFin Retail Specialist, assisting Global Retail Corp store procurement and merchandising teams with invoice reconciliation.",
+    "tone": "helpful_business",
+    "strictness": "standard"
+  },
+  "compliance_thresholds": {
+    "unusual_amount_multiplier": 3.0,
+    "hsn_price_deviation_percent": 50.0,
+    "flag_missing_gst": true
+  }
+}

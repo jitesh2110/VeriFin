@@ -7,11 +7,21 @@ import google.generativeai as genai
 import fitz  # PyMuPDF
 from PIL import Image
 import io
+import os
+import sys
 import json
 import re
 from pathlib import Path
 from dotenv import load_dotenv
-import os
+
+# Ensure UTF-8 output encoding on Windows console
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
+from prompt_manager import prompt_manager
 
 load_dotenv(r"C:\D\Dev\Projects\VeriFin\.env")
 
@@ -24,26 +34,36 @@ class GeminiVisionOCR:
         self.model = genai.GenerativeModel('gemini-2.5-flash')
         print("✅ Gemini Vision OCR initialized!")
     
-    def convert_pdf_to_images(self, pdf_path):
-        """Convert ALL PDF pages to high-quality images"""
+    def convert_pdf_to_images(self, file_path):
+        """Convert PDF pages or load direct image as PIL Image list"""
+        path = Path(file_path)
+        ext = path.suffix.lower()
+
+        # Handle direct image files
+        if ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff']:
+            try:
+                img = Image.open(str(file_path))
+                if img.mode not in ("RGB", "L"):
+                    img = img.convert("RGB")
+                return [img]
+            except Exception as e:
+                print(f"❌ Direct image loading error: {e}")
+                return None
+
+        # Handle PDF documents
         try:
-            doc = fitz.open(str(pdf_path))
+            doc = fitz.open(str(file_path))
             images = []
-            
             print(f"📄 PDF has {len(doc)} pages")
             
             for page_num in range(len(doc)):
                 page = doc.load_page(page_num)
-                
-                # High resolution for better OCR
-                mat = fitz.Matrix(2.5, 2.5)  # 300 DPI
+                # 200 DPI matrix is optimal balance of sharpness and speed
+                mat = fitz.Matrix(2.0, 2.0)
                 pix = page.get_pixmap(matrix=mat, alpha=False)
-                
-                # Convert to PIL Image
                 img_data = pix.tobytes("png")
                 image = Image.open(io.BytesIO(img_data))
                 images.append(image)
-                
                 print(f"✅ Converted page {page_num + 1}/{len(doc)}: {image.size}")
             
             doc.close()
@@ -57,99 +77,17 @@ class GeminiVisionOCR:
         images = self.convert_pdf_to_images(pdf_path)
         return images[0] if images else None
     
-    def create_extraction_prompt(self):
-        """Create detailed prompt for Gemini to extract invoice data"""
-        prompt = """You are an expert invoice data extraction AI. Analyze this invoice image carefully and extract ALL the following information:
-
-**CRITICAL INSTRUCTIONS:**
-1. Extract data EXACTLY as it appears on the invoice
-2. For dates, use DD-MM-YYYY or DD/MM/YYYY format
-3. For amounts, extract only numbers (no currency symbols)
-4. **GST NUMBER - EXTREMELY IMPORTANT:**
-   - Extract ONLY the VENDOR/SELLER/SUPPLIER GSTIN.
-   - Do NOT extract the buyer/customer GSTIN.
-   - Read the GSTIN EXACTLY character-by-character as printed on the invoice.
-   - DO NOT add, remove, duplicate, reorder, or autocorrect any characters.
-   - A GSTIN has EXACTLY 15 characters.
-   - Format: 2 digits + 5 letters + 4 digits + 1 letter + 1 alphanumeric + Z + 1 alphanumeric.
-   - The 5-letter section must be transcribed exactly as visible.
-   - Carefully distinguish between A, E, F, P, etc.
-   - Before returning a GSTIN, count the characters and verify that it contains exactly 15 characters.
-   - If the GSTIN is unclear or cannot be read confidently, return an empty list rather than guessing.
-   - NEVER insert an additional character just to match a GSTIN pattern.
-5. If any field is not found, use "Unknown" for text fields and 0 for numeric fields
-
-**EXTRACT THE FOLLOWING:**
-
-1. **Invoice Number**: The invoice/bill number (look for: Invoice No, Bill No, Inv No, etc.)
-2. **Vendor/Company Name**: The company/vendor issuing the invoice (usually at top in large text)
-3. **Invoice Date**: The date of invoice (look for: Date, Invoice Date, Bill Date, etc.)
-4. **Total Amount**: The final total amount payable (look for: Total, Grand Total, Amount Payable, Net Amount)
-5. **GST Numbers**: ONLY the VENDOR/SELLER GST number (from vendor details section, NOT from buyer/customer section)
-6. **GST Rate**: The TOTAL GST percentage applied
-   - If CGST and SGST are separate, ADD them together (e.g., CGST 9% + SGST 9% = 18% total GST)
-   - If IGST is given, use that directly
-   - If only one GST rate is shown, use that
-   - Examples: 
-     * CGST 9% + SGST 9% → return "18%"
-     * CGST 6% + SGST 6% → return "12%"
-     * IGST 18% → return "18%"
-7. **CGST Rate**: The CGST percentage if shown separately (e.g., 9%, 6%, 2.5%)
-8. **SGST Rate**: The SGST percentage if shown separately (e.g., 9%, 6%, 2.5%)
-9. **IGST Rate**: The IGST percentage if shown (e.g., 18%, 12%, 5%)
-10. **HSN Number**: The primary HSN/SAC code (4-8 digit code, look for: HSN, SAC, HSN Code, SAC Code)
-8. **Vendor Address**: Complete address of the vendor
-9. **Line Items**: Extract all items/services with:
-   - Item description
-   - HSN/SAC code (if present)
-   - Quantity
-   - Rate/Price
-   - Amount
-
-**RETURN FORMAT:**
-Return ONLY a valid JSON object with this EXACT structure (no markdown, no code blocks, just pure JSON):
-
-{
-  "invoice_number": "extracted invoice number or Unknown",
-  "vendor_name": "extracted vendor/company name or Unknown",
-  "invoice_date": "DD-MM-YYYY or Unknown",
-  "total_amount": 0.0,
-  "gst_numbers": ["list of all GST numbers found"],
-  "gst_rate": "TOTAL GST percentage (CGST+SGST or IGST) e.g., 18%, 12%, 5% or Unknown",
-  "cgst_rate": "CGST percentage if separate (e.g., 9%, 6%) or Unknown",
-  "sgst_rate": "SGST percentage if separate (e.g., 9%, 6%) or Unknown",
-  "igst_rate": "IGST percentage if applicable (e.g., 18%, 12%) or Unknown",
-  "hsn_number": "primary HSN/SAC code or Unknown",
-  "vendor_address": "complete address or Unknown",
-  "line_items": [
-    {
-      "description": "item description",
-      "hsn_code": "HSN/SAC code or empty",
-      "quantity": 0,
-      "rate": 0.0,
-      "amount": 0.0
-    }
-  ],
-  "hsn_codes": ["list of all HSN/SAC codes found"],
-  "raw_extracted_text": "any other important text you see"
-}
-
-**IMPORTANT:**
-- Be thorough and accurate
-- Extract ALL GST numbers you find
-- Extract ALL HSN/SAC codes
-- If you see multiple amounts, choose the FINAL TOTAL
-- Return ONLY the JSON, nothing else"""
-
-        return prompt
+    def create_extraction_prompt(self, company_id: str = "comp_default"):
+        """Create company-tailored prompt for Gemini via prompt_manager"""
+        return prompt_manager.build_extraction_prompt(company_id=company_id)
     
-    def extract_invoice_data(self, image):
+    def extract_invoice_data(self, image, company_id: str = "comp_default"):
         """Use Gemini Vision to extract structured data from invoice image"""
         try:
-            print("🔍 Sending image to Gemini Vision AI...")
+            print(f"🔍 Sending image to Gemini Vision AI for company [{company_id}]...")
             
-            # Create prompt
-            prompt = self.create_extraction_prompt()
+            # Create company-specific prompt
+            prompt = self.create_extraction_prompt(company_id=company_id)
             
             # Send to Gemini Vision
             response = self.model.generate_content([prompt, image])
@@ -186,29 +124,29 @@ Return ONLY a valid JSON object with this EXACT structure (no markdown, no code 
             print(f"❌ Gemini Vision error: {e}")
             return None
     
-    def process_invoice(self, file_path):
+    def process_invoice(self, file_path, company_id: str = "comp_default"):
         """
-        Main processing function - handles multi-page PDFs
+        Main processing function - handles multi-page PDFs with company prompt configuration
         Returns structured invoice data
         """
         print(f"\n{'='*60}")
-        print(f"🔍 Processing Invoice: {Path(file_path).name}")
+        print(f"🔍 Processing Invoice: {Path(file_path).name} (Tenant: {company_id})")
         print(f"{'='*60}")
         
-        # Convert ALL PDF pages to images
+        # Convert ALL PDF pages to images or load direct image
         images = self.convert_pdf_to_images(file_path)
         
         if not images:
             return {
                 'success': False,
-                'error': 'Failed to convert PDF to images'
+                'error': 'Failed to convert document to images'
             }
         
-        # Process all pages
+        # Process all pages with company prompt
         all_extracted_data = []
         for page_num, image in enumerate(images, 1):
             print(f"\n📄 Processing page {page_num}/{len(images)}...")
-            extracted_data = self.extract_invoice_data(image)
+            extracted_data = self.extract_invoice_data(image, company_id=company_id)
             if extracted_data:
                 all_extracted_data.append(extracted_data)
         

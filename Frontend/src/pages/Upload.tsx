@@ -3,18 +3,24 @@ import { DashboardLayout } from "@/components/layout/DashboardLayout";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Upload as UploadIcon, FileText, CheckCircle, AlertCircle, Clock, Calendar } from "lucide-react";
+import { Upload as UploadIcon, FileText, CheckCircle, AlertCircle, Clock, Calendar, Edit3, Image as ImageIcon, Building2 } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { toast } from "sonner";
+import { ManualInvoiceModal } from "@/components/invoices/ManualInvoiceModal";
+import { fetchWithTenant, AI_AGENT_BASE } from "@/lib/apiClient";
+import { useAuth } from "@/contexts/AuthContext";
 
 interface UploadedFile {
   id: string;
   name: string;
   uploadTime: string;
   uploadedAt?: string;
-  status: "processing" | "completed" | "error";
+  status: "processing" | "completed" | "error" | "needs_manual_review";
   accuracy: number;
   progress: number;
+  draftId?: string;
+  imageUrl?: string;
+  thumbnailUrl?: string;
   extractedData?: {
     // Basic extraction
     invoiceNumber: string;
@@ -25,6 +31,10 @@ interface UploadedFile {
     gstRate?: string;
     hsnNumber?: string;
     ocrConfidence: number;
+    imageUrl?: string;
+    thumbnailUrl?: string;
+    draftId?: string;
+    isManualEntry?: boolean;
     
     // Enhanced extraction
     hsnSacCodes?: string[];
@@ -78,15 +88,22 @@ const Upload = () => {
   const [files, setFiles] = useState<UploadedFile[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isLoadingHistory, setIsLoadingHistory] = useState(true);
+  
+  // Mid-layer manual entry modal state
+  const [isManualModalOpen, setIsManualModalOpen] = useState(false);
+  const [manualModalData, setManualModalData] = useState<any>(undefined);
+  
+  const { companyName, companyId, activeProjectId } = useAuth();
 
-  // Load past invoices from MongoDB on component mount
+  // Load past invoices from MongoDB on component mount or tenant change
   useEffect(() => {
     loadInvoiceHistory();
-  }, []);
+  }, [companyId, activeProjectId]);
 
   const loadInvoiceHistory = async () => {
     try {
-      const response = await fetch('http://localhost:8000/api/invoices/history?limit=20');
+      setIsLoadingHistory(true);
+      const response = await fetchWithTenant(`${AI_AGENT_BASE}/api/invoices/history?limit=25`);
       const data = await response.json();
       
       if (data.success && data.invoices) {
@@ -95,9 +112,12 @@ const Upload = () => {
           name: inv.filename || inv.fileName || 'invoice.pdf',
           uploadTime: inv.uploadDate ? new Date(inv.uploadDate).toLocaleString('en-IN') : 'Unknown',
           uploadedAt: inv.uploadDate,
-          status: "completed",
+          status: inv.processingStatus === "needs_manual_review" ? "needs_manual_review" : "completed",
           accuracy: inv.ocrConfidence || inv.ocr_confidence || 0,
           progress: 100,
+          draftId: inv._id || inv.id,
+          imageUrl: inv.imageUrl || inv.image_url,
+          thumbnailUrl: inv.thumbnailUrl || inv.thumbnail_url,
           extractedData: {
             invoiceNumber: inv.invoiceNumber || inv.invoice_number || 'Unknown',
             vendorName: inv.vendorName || inv.vendor_name || 'Unknown',
@@ -107,6 +127,10 @@ const Upload = () => {
             gstRate: inv.gstRate || inv.gst_rate || 'Unknown',
             hsnNumber: inv.hsnNumber || inv.hsn_number || 'Unknown',
             ocrConfidence: inv.ocrConfidence || inv.ocr_confidence || 0,
+            imageUrl: inv.imageUrl || inv.image_url,
+            thumbnailUrl: inv.thumbnailUrl || inv.thumbnail_url,
+            draftId: inv._id || inv.id,
+            isManualEntry: inv.isManualEntry || inv.is_manual_entry || false,
             // Load validation results from compliance data
             gstValidations: inv.complianceResults?.gst_validations || inv.compliance_results?.gst_validations || [],
             hsnValidations: inv.complianceResults?.hsn_validations || inv.compliance_results?.hsn_validations || [],
@@ -116,16 +140,11 @@ const Upload = () => {
             complianceStatus: inv.complianceResults?.compliance_status || inv.compliance_results?.compliance_status || 'Unknown',
             riskScore: inv.complianceResults?.risk_score || inv.compliance_results?.risk_score || 0,
             riskLevel: inv.complianceResults?.risk_level || inv.compliance_results?.risk_level || 'Unknown',
-            // Add GST verification results
             gstVerification: inv.gstVerification || inv.gst_verification || [],
-            // Add anomalies
-            anomaliesDetected: inv.anomalies?.map((a: any) => a.anomaly_type || a.anomalyType) || [],
+            anomaliesDetected: inv.anomalies?.map((a: any) => a.description || a.anomalyType || a.anomaly_type) || [],
           }
         }));
-        console.log('📥 Loaded invoice history:', historicalFiles.length, 'invoices');
         setFiles(historicalFiles);
-      } else {
-        console.log('⚠️ No invoices found in response');
       }
     } catch (error) {
       console.error('❌ Failed to load invoice history:', error);
@@ -175,17 +194,16 @@ const Upload = () => {
           f.id === fileId ? { ...f, progress: 50 } : f
         ));
 
-        // Call REAL FINTEL AI API
+        // Call REAL FINTEL AI API with tenant context
         const formData = new FormData();
         formData.append('file', file);
 
-        const response = await fetch('http://localhost:8000/api/invoices/upload', {
+        const response = await fetchWithTenant(`${AI_AGENT_BASE}/api/invoices/upload`, {
           method: 'POST',
           body: formData,
         });
 
         console.log('Response status:', response.status);
-        console.log('Response headers:', response.headers);
 
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -201,6 +219,9 @@ const Upload = () => {
               ...f,
               progress: 100,
               status: "completed",
+              draftId: result.data.invoiceId,
+              imageUrl: result.imageUrl || result.data.imageUrl,
+              thumbnailUrl: result.thumbnailUrl || result.data.thumbnailUrl,
               accuracy: result.data.ocrConfidence || 0, // REAL accuracy from OCR
               extractedData: {
                 // Basic extraction
@@ -212,6 +233,10 @@ const Upload = () => {
                 gstRate: result.data.gstRate || result.data.gst_rate || 'Unknown',
                 hsnNumber: result.data.hsnNumber || result.data.hsn_number || 'Unknown',
                 ocrConfidence: result.data.ocrConfidence || 0,
+                imageUrl: result.imageUrl || result.data.imageUrl,
+                thumbnailUrl: result.thumbnailUrl || result.data.thumbnailUrl,
+                draftId: result.data.invoiceId,
+                isManualEntry: result.data.isManualEntry || false,
                 
                 // Enhanced extraction
                 hsnSacCodes: result.data.hsnSacCodes || [],
@@ -243,8 +268,51 @@ const Upload = () => {
           ));
           
           toast.success(`${file.name} processed successfully!`);
+        } else if (result.needs_manual_review) {
+          // Mid-Layer Fallback: AI OCR broke down or had low confidence (<65%)
+          setFiles(prev => prev.map(f => 
+            f.id === fileId ? {
+              ...f,
+              progress: 100,
+              status: "needs_manual_review",
+              draftId: result.draftId,
+              imageUrl: result.imageUrl,
+              thumbnailUrl: result.thumbnailUrl,
+              accuracy: result.partialData?.ocrConfidence || 0,
+              extractedData: {
+                invoiceNumber: result.partialData?.invoiceNumber || 'Unknown',
+                vendorName: result.partialData?.vendorName || 'Unknown',
+                invoiceAmount: result.partialData?.invoiceAmount || 0,
+                invoiceDate: result.partialData?.invoiceDate || 'Unknown',
+                gstNumbers: result.partialData?.gstNumbers || [],
+                ocrConfidence: result.partialData?.ocrConfidence || 0,
+                imageUrl: result.imageUrl,
+                thumbnailUrl: result.thumbnailUrl,
+                draftId: result.draftId,
+                isManualEntry: false,
+              }
+            } : f
+          ));
+
+          toast.warning(`OCR confidence was low (<65%). Draft saved. Please review manually.`, {
+            duration: 6000,
+          });
+
+          // Automatically launch Manual Review modal with the uploaded receipt image
+          setManualModalData({
+            draftId: result.draftId,
+            imageUrl: result.imageUrl,
+            thumbnailUrl: result.thumbnailUrl,
+            invoiceNumber: result.partialData?.invoiceNumber || '',
+            vendorName: result.partialData?.vendorName || '',
+            invoiceDate: result.partialData?.invoiceDate || '',
+            invoiceAmount: result.partialData?.invoiceAmount || 0,
+            gstNumbers: result.partialData?.gstNumbers || [],
+            lineItems: []
+          });
+          setIsManualModalOpen(true);
         } else {
-          // Handle error
+          // Handle processing error
           setFiles(prev => prev.map(f => 
             f.id === fileId ? {
               ...f,
@@ -254,12 +322,11 @@ const Upload = () => {
             } : f
           ));
           
-          toast.error(`Failed to process ${file.name}`);
+          toast.error(`Failed to process ${file.name}: ${result.error || "Processing error"}`);
         }
 
-      } catch (error) {
+      } catch (error: any) {
         console.error('Upload error:', error);
-        console.error('Error details:', JSON.stringify(error, null, 2));
         
         setFiles(prev => prev.map(f => 
           f.id === fileId ? {
@@ -279,11 +346,42 @@ const Upload = () => {
     switch (status) {
       case "completed":
         return <CheckCircle className="h-5 w-5 text-green-500" />;
+      case "needs_manual_review":
+        return <AlertCircle className="h-5 w-5 text-amber-500" />;
       case "error":
         return <AlertCircle className="h-5 w-5 text-red-500" />;
       case "processing":
         return <Clock className="h-5 w-5 text-blue-500" />;
     }
+  };
+
+  const getStatusText = (status: UploadedFile["status"]) => {
+    switch (status) {
+      case "completed":
+        return "Completed";
+      case "needs_manual_review":
+        return "Needs Review";
+      case "error":
+        return "Error";
+      case "processing":
+        return "Processing";
+    }
+  };
+
+  const openReviewModal = (file: UploadedFile) => {
+    setManualModalData({
+      draftId: file.draftId || file.id,
+      imageUrl: file.imageUrl || file.extractedData?.imageUrl,
+      thumbnailUrl: file.thumbnailUrl || file.extractedData?.thumbnailUrl,
+      invoiceNumber: file.extractedData?.invoiceNumber !== 'Unknown' ? file.extractedData?.invoiceNumber : '',
+      vendorName: file.extractedData?.vendorName !== 'Unknown' ? file.extractedData?.vendorName : '',
+      invoiceAmount: file.extractedData?.invoiceAmount || 0,
+      invoiceDate: file.extractedData?.invoiceDate !== 'Unknown' ? file.extractedData?.invoiceDate : '',
+      gstNumbers: file.extractedData?.gstNumbers || [],
+      gstRate: file.extractedData?.gstRate !== 'Unknown' ? file.extractedData?.gstRate : '18%',
+      hsnNumber: file.extractedData?.hsnNumber !== 'Unknown' ? file.extractedData?.hsnNumber : '',
+    });
+    setIsManualModalOpen(true);
   };
 
   const showDetails = (file: UploadedFile) => {
@@ -351,25 +449,35 @@ Processed by: FINTEL AI v2.0 Complete Compliance System
     }
   };
 
-  const getStatusText = (status: UploadedFile["status"]) => {
-    switch (status) {
-      case "completed":
-        return "Completed";
-      case "error":
-        return "Error";
-      case "processing":
-        return "Processing";
-    }
-  };
-
   return (
     <DashboardLayout>
       <div className="space-y-6">
-        <div>
-          <h1 className="text-3xl font-bold mb-2">Upload Invoices</h1>
-          <p className="text-muted-foreground">
-            Upload PDF, PNG, or JPEG invoices for AI-powered extraction and compliance validation
-          </p>
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <h1 className="text-3xl font-bold">Upload Invoices</h1>
+              {companyName && (
+                <Badge variant="secondary" className="text-xs flex items-center gap-1 font-medium">
+                  <Building2 className="h-3 w-3" />
+                  {companyName}
+                </Badge>
+              )}
+            </div>
+            <p className="text-muted-foreground">
+              Upload PDF, PNG, or JPEG invoices for AI-powered extraction and compliance validation
+            </p>
+          </div>
+          <Button 
+            variant="outline" 
+            className="gap-2 self-start sm:self-auto border-dashed hover:border-primary shadow-sm"
+            onClick={() => {
+              setManualModalData(undefined);
+              setIsManualModalOpen(true);
+            }}
+          >
+            <Edit3 className="h-4 w-4" />
+            Manual Entry (Fallback)
+          </Button>
         </div>
 
         {/* Upload Zone with Latest Result */}
@@ -415,15 +523,35 @@ Processed by: FINTEL AI v2.0 Complete Compliance System
               <div>
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="text-lg font-semibold">Latest Invoice</h3>
-                  <Badge variant="default" className="bg-green-100 text-green-800">
-                    <CheckCircle className="h-3 w-3 mr-1" />
-                    Processed
-                  </Badge>
+                  <div className="flex items-center gap-2">
+                    {files[0].extractedData.isManualEntry && (
+                      <Badge variant="secondary" className="text-xs">
+                        Manual Entry
+                      </Badge>
+                    )}
+                    <Badge variant="default" className="bg-green-100 text-green-800">
+                      <CheckCircle className="h-3 w-3 mr-1" />
+                      Processed
+                    </Badge>
+                  </div>
                 </div>
                 <div className="space-y-3">
-                  <div className="flex items-center gap-2 text-sm">
-                    <FileText className="h-4 w-4 text-muted-foreground" />
-                    <span className="font-medium">{files[0].name}</span>
+                  <div className="flex items-center justify-between text-sm">
+                    <div className="flex items-center gap-2 truncate">
+                      <FileText className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                      <span className="font-medium truncate">{files[0].name}</span>
+                    </div>
+                    {files[0].imageUrl && (
+                      <a 
+                        href={`${AI_AGENT_BASE}${files[0].imageUrl}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs text-primary hover:underline flex items-center gap-1 font-medium flex-shrink-0 ml-2"
+                      >
+                        <ImageIcon className="h-3.5 w-3.5" />
+                        Receipt Image
+                      </a>
+                    )}
                   </div>
                   
                   <Card className="p-4 border-l-4 border-l-primary">
@@ -620,6 +748,83 @@ Processed by: FINTEL AI v2.0 Complete Compliance System
                   </Button>
                 </div>
               </div>
+            ) : files.length > 0 && files[0].status === "needs_manual_review" ? (
+              <div>
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-lg font-semibold">Latest Invoice</h3>
+                  <Badge variant="outline" className="border-amber-500 text-amber-700 bg-amber-50">
+                    <AlertCircle className="h-3 w-3 mr-1" />
+                    Needs Manual Review
+                  </Badge>
+                </div>
+                <div className="space-y-4">
+                  <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800">
+                    <div className="font-semibold mb-1 flex items-center gap-1.5">
+                      <AlertCircle className="h-4 w-4 text-amber-600" />
+                      AI OCR Breakdown / Low Confidence
+                    </div>
+                    Confidence fell below 65%. A draft was saved. Please review or correct the invoice manually to complete regulatory compliance checks.
+                  </div>
+
+                  <div className="flex items-center justify-between p-3 rounded-lg border bg-muted/30">
+                    <div className="flex items-center gap-3">
+                      {(files[0].thumbnailUrl || files[0].imageUrl) ? (
+                        <img 
+                          src={`${AI_AGENT_BASE}${files[0].thumbnailUrl || files[0].imageUrl}`} 
+                          alt="Receipt thumbnail" 
+                          className="w-12 h-12 object-cover rounded border"
+                          onError={(e) => { (e.target as HTMLElement).style.display = 'none'; }}
+                        />
+                      ) : (
+                        <FileText className="h-6 w-6 text-primary" />
+                      )}
+                      <div>
+                        <p className="font-medium text-sm truncate max-w-[200px]">{files[0].name}</p>
+                        <p className="text-xs text-muted-foreground">Draft ID: {files[0].draftId || files[0].id}</p>
+                      </div>
+                    </div>
+                    {(files[0].imageUrl) && (
+                      <a 
+                        href={`${AI_AGENT_BASE}${files[0].imageUrl}`} 
+                        target="_blank" 
+                        rel="noopener noreferrer"
+                        className="text-xs text-primary hover:underline flex items-center gap-1"
+                      >
+                        <ImageIcon className="h-3.5 w-3.5" />
+                        View Receipt
+                      </a>
+                    )}
+                  </div>
+
+                  <Card className="p-4 border-l-4 border-l-amber-500">
+                    <h4 className="font-semibold text-sm mb-2.5">Partial Extracted Values</h4>
+                    <div className="space-y-2 text-sm">
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Vendor:</span>
+                        <span className="font-medium">{files[0].extractedData?.vendorName || 'Not detected'}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Invoice #:</span>
+                        <span className="font-medium">{files[0].extractedData?.invoiceNumber || 'Not detected'}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Amount:</span>
+                        <span className="font-medium">
+                          {files[0].extractedData?.invoiceAmount ? `₹${files[0].extractedData.invoiceAmount}` : 'Not detected'}
+                        </span>
+                      </div>
+                    </div>
+                  </Card>
+
+                  <Button 
+                    className="w-full bg-amber-600 hover:bg-amber-700 text-white gap-2"
+                    onClick={() => openReviewModal(files[0])}
+                  >
+                    <Edit3 className="h-4 w-4" />
+                    Review & Correct Invoice
+                  </Button>
+                </div>
+              </div>
             ) : files.length > 0 && files[0].status === "processing" ? (
               <div className="flex flex-col items-center justify-center h-full space-y-4">
                 <Clock className="h-12 w-12 text-primary animate-spin" />
@@ -659,11 +864,37 @@ Processed by: FINTEL AI v2.0 Complete Compliance System
             {files.map((file, index) => (
               <div key={index} className="flex items-center justify-between p-4 rounded-lg border hover:bg-accent/50 transition-colors">
                 <div className="flex items-center gap-3 flex-1">
-                  <FileText className="h-5 w-5 text-primary" />
+                  {file.thumbnailUrl ? (
+                    <img 
+                      src={`${AI_AGENT_BASE}${file.thumbnailUrl}`} 
+                      alt="Thumbnail" 
+                      className="w-10 h-10 object-cover rounded border flex-shrink-0"
+                      onError={(e) => { (e.target as HTMLElement).style.display = 'none'; }}
+                    />
+                  ) : (
+                    <div className="w-10 h-10 rounded border bg-muted flex items-center justify-center flex-shrink-0">
+                      <FileText className="h-5 w-5 text-primary" />
+                    </div>
+                  )}
                   <div className="flex-1 min-w-0">
-                    <p className="font-medium truncate">{file.name}</p>
+                    <div className="flex items-center gap-2">
+                      <p className="font-medium truncate">{file.name}</p>
+                      {file.extractedData?.isManualEntry && (
+                        <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4">Manual</Badge>
+                      )}
+                    </div>
                     <div className="flex items-center gap-4 text-sm text-muted-foreground mt-1">
-                      <span className="flex items-center gap-1">
+                      {file.extractedData?.vendorName && file.extractedData.vendorName !== 'Unknown' && (
+                        <span className="font-medium text-foreground text-xs">
+                          {file.extractedData.vendorName}
+                        </span>
+                      )}
+                      {file.extractedData?.invoiceAmount ? (
+                        <span className="text-xs">
+                          ₹{file.extractedData.invoiceAmount.toLocaleString('en-IN')}
+                        </span>
+                      ) : null}
+                      <span className="flex items-center gap-1 text-xs">
                         <Calendar className="h-3 w-3" />
                         {file.uploadedAt ? new Date(file.uploadedAt).toLocaleDateString('en-IN', { 
                           day: '2-digit', 
@@ -671,31 +902,68 @@ Processed by: FINTEL AI v2.0 Complete Compliance System
                           year: 'numeric' 
                         }) : file.uploadTime}
                       </span>
-                      <span className="flex items-center gap-1">
-                        <Clock className="h-3 w-3" />
-                        {file.uploadedAt ? new Date(file.uploadedAt).toLocaleTimeString('en-IN', { 
-                          hour: '2-digit', 
-                          minute: '2-digit'
-                        }) : '—'}
-                      </span>
                     </div>
                   </div>
                 </div>
-                <div className="flex items-center gap-3">
-                  <Badge 
-                    variant={file.status === "completed" ? "default" : "secondary"}
-                    className={file.status === "completed" ? "bg-green-100 text-green-800" : ""}
-                  >
-                    {file.status === "completed" ? "Processed" : "Processing"}
-                  </Badge>
-                  <Button 
-                    size="sm" 
-                    variant="outline"
-                    onClick={() => showDetails(file)}
-                    disabled={file.status === "processing"}
-                  >
-                    View Details
-                  </Button>
+                <div className="flex items-center gap-2">
+                  {file.imageUrl && (
+                    <a
+                      href={`${AI_AGENT_BASE}${file.imageUrl}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="p-2 text-muted-foreground hover:text-primary rounded hover:bg-muted"
+                      title="View Receipt Image"
+                    >
+                      <ImageIcon className="h-4 w-4" />
+                    </a>
+                  )}
+
+                  {file.status === "needs_manual_review" ? (
+                    <>
+                      <Badge variant="outline" className="border-amber-500 text-amber-700 bg-amber-50">
+                        Needs Review
+                      </Badge>
+                      <Button 
+                        size="sm" 
+                        variant="default"
+                        className="bg-amber-600 hover:bg-amber-700 text-white gap-1"
+                        onClick={() => openReviewModal(file)}
+                      >
+                        <Edit3 className="h-3.5 w-3.5" />
+                        Review
+                      </Button>
+                    </>
+                  ) : file.status === "completed" ? (
+                    <>
+                      <Badge variant="default" className="bg-green-100 text-green-800">
+                        Processed
+                      </Badge>
+                      <Button 
+                        size="sm" 
+                        variant="outline"
+                        onClick={() => showDetails(file)}
+                      >
+                        Details
+                      </Button>
+                    </>
+                  ) : file.status === "error" ? (
+                    <>
+                      <Badge variant="destructive" className="bg-red-100 text-red-800">
+                        Error
+                      </Badge>
+                      <Button 
+                        size="sm" 
+                        variant="outline"
+                        onClick={() => showDetails(file)}
+                      >
+                        Details
+                      </Button>
+                    </>
+                  ) : (
+                    <Badge variant="secondary">
+                      Processing
+                    </Badge>
+                  )}
                 </div>
               </div>
             ))}
@@ -731,6 +999,17 @@ Processed by: FINTEL AI v2.0 Complete Compliance System
             </div>
           </div>
         </Card>
+
+        {/* Mid-Layer Manual Entry & Review Modal */}
+        <ManualInvoiceModal
+          isOpen={isManualModalOpen}
+          onClose={() => setIsManualModalOpen(false)}
+          initialData={manualModalData}
+          onSuccess={() => {
+            setIsManualModalOpen(false);
+            loadInvoiceHistory();
+          }}
+        />
       </div>
     </DashboardLayout>
   );
